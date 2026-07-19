@@ -1,0 +1,28 @@
+# CodeRabbit configuration — tuned for this repo's autonomous nightly-PR loop.
+# Reviews are ADVISORY: CI is the only merge gate (see the project playbook).
+# Docs: https://docs.coderabbit.ai/reference/yaml-template
+language: "en-US"
+reviews:
+  profile: "chill"                # substance over nitpicks
+  request_changes_workflow: false # never leave a blocking "changes requested" state
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/*.lock"
+    - "!**/workflow-state/**"
+  path_instructions:
+    - path: "**/*.py"
+      instructions: >-
+        Focus on correctness (especially numerical accuracy and shape/dtype
+        handling), API stability, portability across CPU/ARM, and test
+        coverage. Skip formatting/style nits — ruff enforces those in CI.
+    - path: "**/*.rs"
+      instructions: >-
+        Focus on soundness, unsafe-block justification, and cross-platform
+        (aarch64) portability. Skip style nits covered by clippy/rustfmt.
+chat:
+  auto_reply: true
