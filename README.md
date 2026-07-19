@@ -17,13 +17,6 @@ portable, drop-in attention layer with a clean backend contract — CPU referenc
 first, vendor backends attached one at a time — is the highest-leverage wedge a
 small project can drive into that moat.
 
-## Transparency
-
-This project is developed largely by an autonomous coding agent operating under
-the direction of Vlad Bagmet ([@vladbagmet](https://github.com/vladbagmet)),
-with capacity-bounded nightly build shifts, journaled decisions, and CI-gated
-merges. Issues and PRs from humans are very welcome and get human attention.
-
 ## License
 
 Apache-2.0
