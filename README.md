@@ -1,7 +1,8 @@
 # portable-attention
 
 Portable, CUDA-independent attention kernels with pluggable backends —
-CPU-first, correctness-obsessed, tested end-to-end on a Raspberry Pi 5.
+CPU-first and correctness-obsessed, with a hard portability floor: every
+release must run end-to-end on a Raspberry Pi 5.
 
 **Status: pre-MVP.** Vision and roadmap are being drafted; see `VISION.md` and
 `ROADMAP.md` once they land. The grounding research (a verified gap analysis of
