@@ -4,9 +4,20 @@ Portable, CUDA-independent attention kernels with pluggable backends —
 CPU-first and correctness-obsessed, with a hard portability floor: every
 release must run end-to-end on an $80 computer.
 
-**Status: pre-MVP.** Vision and roadmap are being drafted; see `VISION.md` and
-`ROADMAP.md` once they land. The grounding research (a verified gap analysis of
-the non-CUDA AI compute landscape, 2026-07-19) is in `RESEARCH.md`.
+**Status: pre-MVP (M0 walking skeleton).** Direction lives in `VISION.md` and
+`ROADMAP.md`; the grounding research (a verified gap analysis of the non-CUDA AI
+compute landscape, 2026-07-19) is in `RESEARCH.md`. A CPU reference
+`scaled_dot_product_attention` and its test harness are in place; the public API
+and packaging are still being frozen (see roadmap M0.3).
+
+## Development
+
+```sh
+uv venv && uv pip install -e ".[dev]"
+uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
+```
+
+Everything runs on CPU with no GPU required — that is the point.
 
 ## Why
 

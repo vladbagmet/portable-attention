@@ -16,9 +16,21 @@ Thanks for your interest — contributions are welcome, including at this early
 
 ## Development setup
 
-The M0 milestone (package skeleton, test harness, CI) is landing now; this
-section will be updated with concrete setup commands when it does. Until then,
-docs and design-discussion PRs are the easiest way in.
+The project is CPU-first and needs no GPU. With [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv venv
+uv pip install -e ".[dev]"
+```
+
+Run the same gates CI runs, before you push:
+
+```sh
+uv run ruff check .          # lint
+uv run ruff format --check . # formatting
+uv run mypy                  # typecheck (strict)
+uv run pytest                # tests
+```
 
 ## Reviews
 
