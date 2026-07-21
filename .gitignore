@@ -9,4 +9,12 @@ venv/
 # Tooling caches
 .pytest_cache/
 .mypy_cache/
+.pyright/
 .ruff_cache/
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+# uv (CI installs via `uv pip install -e`, not a lockfile)
+uv.lock

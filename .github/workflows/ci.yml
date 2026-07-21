@@ -26,8 +26,12 @@ jobs:
         run: uv run ruff check .
       - name: Format check (ruff)
         run: uv run ruff format --check .
-      - name: Typecheck (mypy)
-        run: uv run mypy
+      - name: Typecheck (pyright)
+        run: uv run pyright
+      - name: Security (bandit)
+        run: uvx --from bandit bandit -c pyproject.toml -r src -x tests
+      - name: Dependency audit (pip-audit)
+        run: uv run pip-audit
 
   test:
     name: test (py${{ matrix.python-version }})
@@ -44,5 +48,7 @@ jobs:
         run: |
           uv venv --python ${{ matrix.python-version }}
           uv pip install -e ".[dev]"
-      - name: Test (pytest)
-        run: uv run pytest
+      - name: Test (pytest + coverage)
+        run: |
+          uv run coverage run -m pytest
+          uv run coverage report
