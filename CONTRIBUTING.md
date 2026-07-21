@@ -23,14 +23,16 @@ uv venv
 uv pip install -e ".[dev]"
 ```
 
-Run the same gates CI runs, before you push:
+Run the same gate CI runs, before you push — a single command:
 
 ```sh
-uv run ruff check .          # lint
-uv run ruff format --check . # formatting
-uv run mypy                  # typecheck (strict)
-uv run pytest                # tests
+./scripts/check.sh
 ```
+
+It runs, in order: `ruff check` (lint), `ruff format --check` (formatting),
+`pyright` (strict typecheck), `bandit` (security), `pip-audit` (dependency
+vulnerabilities), and `coverage run -m pytest` + `coverage report` (tests with
+a coverage floor). Every step must pass; do not weaken a check to get green.
 
 ## Reviews
 

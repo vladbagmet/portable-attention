@@ -84,7 +84,12 @@ def scaled_dot_product_attention(
         else:
             scores = scores + attn_mask.astype(np.float64)
 
-    scores = scores - np.max(scores, axis=-1, keepdims=True)
+    # Subtract the per-row max for numerical stability. A fully-masked row is
+    # all -inf, whose max is -inf; avoid the -inf - -inf = nan trap by shifting
+    # such rows by 0 (they still exp() to 0 and get zeroed by the divide guard).
+    row_max = np.max(scores, axis=-1, keepdims=True)
+    row_max = np.where(np.isfinite(row_max), row_max, 0.0)
+    scores = scores - row_max
     weights = np.exp(scores)
     denom = np.sum(weights, axis=-1, keepdims=True)
     # Rows fully masked to -inf yield 0/0; define their output as 0.
