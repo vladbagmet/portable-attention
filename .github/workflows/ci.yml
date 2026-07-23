@@ -10,6 +10,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: CI only reads the repo. No job publishes releases, writes
+# packages, or comments, so the default broad token scopes are unnecessary.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: lint + typecheck
