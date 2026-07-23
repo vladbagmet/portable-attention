@@ -111,6 +111,7 @@ def test_explicit_scale_matches_oracle(scale, dtype):
     out = scaled_dot_product_attention(q, k, v, scale=scale)
     expected = _oracle(q, k, v, None, False, scale)
 
+    assert out.dtype == np.dtype(dtype)
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
 
 
@@ -125,6 +126,7 @@ def test_is_causal_matches_triangular_oracle(leading, length, source, e, ev, dty
     out = scaled_dot_product_attention(q, k, v, is_causal=True)
     expected = _oracle(q, k, v, None, True, None)
 
+    assert out.dtype == np.dtype(dtype)
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
 
 
@@ -142,6 +144,7 @@ def test_boolean_mask_matches_oracle(dtype):
     out = scaled_dot_product_attention(q, k, v, attn_mask=mask)
     expected = _oracle(q, k, v, mask, False, None)
 
+    assert out.dtype == np.dtype(dtype)
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
 
 
@@ -156,6 +159,7 @@ def test_additive_float_mask_matches_oracle(dtype):
     out = scaled_dot_product_attention(q, k, v, attn_mask=bias)
     expected = _oracle(q, k, v, bias, False, None)
 
+    assert out.dtype == np.dtype(dtype)
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
 
 
@@ -190,8 +194,10 @@ def test_fully_masked_rows_are_finite_zero(dtype):
     out = scaled_dot_product_attention(q, k, v, attn_mask=mask)
     expected = _oracle(q, k, v, mask, False, None)
 
+    assert out.dtype == np.dtype(dtype)
     assert np.all(np.isfinite(out))
-    np.testing.assert_allclose(out[0], 0.0, atol=1e-12)
+    # Fully-masked rows are exactly zero, not merely close to it.
+    np.testing.assert_array_equal(out[0], np.zeros_like(out[0]))
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
 
 
