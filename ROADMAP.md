@@ -38,11 +38,13 @@ reproducible benchmark harness.
 
 **Goal:** close one real, verified gap end-to-end.
 
-- Candidate: **Vulkan (V3DV)** on this Pi as the portable GPU path, or **Metal**
-  forward+backward on Vlad's Mac (the verified Apple training gap). Pick via a
-  documented spike; CPU reference remains the correctness oracle for both.
-- Optional autograd hook (backward pass) so the layer is training-usable where
-  the ecosystem gap is a *missing backward* (the Apple case).
+- Path: **Vulkan (V3DV)** as the portable GPU backend, validated on low-power
+  ARM hardware. CPU reference remains the correctness oracle.
+- Optional autograd hook (backward pass) so the layer becomes training-usable on
+  the Vulkan path.
+- *Deferred (hardware-gated):* a Metal forward+backward backend for the verified
+  Apple training gap is a separate future track, not part of this roadmap — it
+  requires Apple hardware the current development environment does not have.
 
 ## Continuous (not milestone-gated)
 
