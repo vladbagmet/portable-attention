@@ -14,4 +14,7 @@ from .reference import scaled_dot_product_attention
 
 __all__ = ["__version__", "scaled_dot_product_attention"]
 
+# Single source of truth for the package version. The build backend
+# (hatchling) reads this string directly via [tool.hatch.version] in
+# pyproject.toml, so it must never be duplicated there.
 __version__ = "0.0.1"

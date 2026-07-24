@@ -22,12 +22,21 @@ def scaled_dot_product_attention(
     key: Array,
     value: Array,
     attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+    dropout_p: float = 0.0,
     is_causal: bool = False,
+    *,
     scale: float | None = None,
+    enable_gqa: bool = False,
 ) -> Array:
     """Compute scaled dot-product attention on CPU.
 
-    The surface mirrors ``torch.nn.functional.scaled_dot_product_attention``.
+    The signature and parameter order mirror
+    ``torch.nn.functional.scaled_dot_product_attention`` so this can act as a
+    drop-in for the inference path. The CPU reference implements the forward,
+    non-dropout computation; ``dropout_p`` and ``enable_gqa`` are accepted to
+    keep the surface identical but must be left at their defaults (a non-default
+    value raises ``NotImplementedError`` rather than silently ignoring it).
+
     Inputs are batched with an arbitrary number of leading dimensions:
 
     - ``query``: shape ``(*, L, E)``
@@ -43,13 +52,33 @@ def scaled_dot_product_attention(
         attn_mask: Optional mask broadcastable to ``(*, L, S)``. A boolean mask
             keeps positions that are ``True`` (``False`` positions are masked
             out); a floating mask is added to the attention scores.
+        dropout_p: Attention dropout probability. Only ``0.0`` is supported by
+            this deterministic CPU reference; any other value raises
+            ``NotImplementedError``.
         is_causal: If ``True``, apply a causal (lower-triangular) mask. Must not
             be combined with an explicit ``attn_mask``.
-        scale: Softmax scale. Defaults to ``1 / sqrt(E)``.
+        scale: Softmax scale (keyword-only). Defaults to ``1 / sqrt(E)``.
+        enable_gqa: Grouped-query attention. Not yet supported; only ``False``
+            is accepted (any other value raises ``NotImplementedError``).
 
     Returns:
         The attention output.
+
+    Raises:
+        ValueError: On incompatible shapes or ``is_causal`` combined with
+            ``attn_mask``.
+        NotImplementedError: If ``dropout_p != 0.0`` or ``enable_gqa`` is set.
     """
+    if dropout_p != 0.0:
+        raise NotImplementedError(
+            "dropout_p is not supported by the CPU reference backend; "
+            "pass dropout_p=0.0."
+        )
+    if enable_gqa:
+        raise NotImplementedError(
+            "enable_gqa (grouped-query attention) is not yet supported; "
+            "pass enable_gqa=False."
+        )
     if is_causal and attn_mask is not None:
         raise ValueError("Pass either is_causal=True or attn_mask, not both.")
     if query.ndim < 2 or key.ndim < 2 or value.ndim < 2:
