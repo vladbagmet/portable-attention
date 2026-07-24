@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "portable-attention"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Portable, CUDA-independent attention/SDPA with pluggable backends — CPU-first and correctness-obsessed."
 readme = "README.md"
 license = "Apache-2.0"
@@ -34,8 +34,16 @@ dev = [
     "coverage[toml]>=7",
 ]
 
+# Single source of truth for the version: hatchling reads __version__ straight
+# from the package, so the string lives in exactly one place (see __init__.py).
+[tool.hatch.version]
+path = "src/portable_attention/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/portable_attention"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.ruff]
 line-length = 88
