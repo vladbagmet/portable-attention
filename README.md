@@ -44,12 +44,17 @@ causal_out = scaled_dot_product_attention(
 print(causal_out.shape)  # (2, 4, 8)
 ```
 
-The signature mirrors
+The signature matches
 [`torch.nn.functional.scaled_dot_product_attention`](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
-(`query, key, value, attn_mask=None, is_causal=False, scale=None`), so it can
-act as a drop-in on hardware where the fast vendor path is missing. Only the
-names re-exported from the top-level package — `scaled_dot_product_attention`
-and `__version__` — are public; everything else is internal and may change.
+(`query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, *,
+scale=None, enable_gqa=False`), so it can act as a drop-in for the inference
+path on hardware where the fast vendor path is missing. The CPU reference
+implements the forward, non-dropout computation; `dropout_p` and `enable_gqa`
+are accepted for signature compatibility but must be left at their defaults (a
+non-default value raises `NotImplementedError` rather than being silently
+ignored). Only the names re-exported from the top-level package —
+`scaled_dot_product_attention` and `__version__` — are public; everything else
+is internal and may change.
 
 ## Development
 

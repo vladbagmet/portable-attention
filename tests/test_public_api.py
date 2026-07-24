@@ -11,6 +11,9 @@ from __future__ import annotations
 import inspect
 from importlib.metadata import version
 
+import numpy as np
+import pytest
+
 import portable_attention
 from portable_attention import scaled_dot_product_attention
 
@@ -34,8 +37,25 @@ def test_metadata_version_matches_dunder():
 
 
 def test_signature_mirrors_torch_sdpa():
+    # Order and names match torch.nn.functional.scaled_dot_product_attention:
+    # (query, key, value, attn_mask, dropout_p, is_causal, *, scale, enable_gqa)
     params = list(inspect.signature(scaled_dot_product_attention).parameters)
-    assert params == ["query", "key", "value", "attn_mask", "is_causal", "scale"]
+    assert params == [
+        "query",
+        "key",
+        "value",
+        "attn_mask",
+        "dropout_p",
+        "is_causal",
+        "scale",
+        "enable_gqa",
+    ]
+
+
+def test_scale_and_enable_gqa_are_keyword_only():
+    params = inspect.signature(scaled_dot_product_attention).parameters
+    assert params["scale"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["enable_gqa"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_defaults_match_torch_sdpa():
@@ -46,5 +66,23 @@ def test_defaults_match_torch_sdpa():
         ).parameters.items()
     }
     assert defaults["attn_mask"] is None
+    assert defaults["dropout_p"] == 0.0
     assert defaults["is_causal"] is False
     assert defaults["scale"] is None
+    assert defaults["enable_gqa"] is False
+
+
+def test_unsupported_dropout_raises():
+    q = np.zeros((2, 4))
+    k = np.zeros((3, 4))
+    v = np.zeros((3, 5))
+    with pytest.raises(NotImplementedError, match="dropout_p"):
+        scaled_dot_product_attention(q, k, v, dropout_p=0.1)
+
+
+def test_unsupported_gqa_raises():
+    q = np.zeros((2, 4))
+    k = np.zeros((3, 4))
+    v = np.zeros((3, 5))
+    with pytest.raises(NotImplementedError, match="enable_gqa"):
+        scaled_dot_product_attention(q, k, v, enable_gqa=True)
