@@ -32,6 +32,9 @@ dev = [
     "bandit>=1.7",
     "pip-audit>=2.7",
     "coverage[toml]>=7",
+    # Optional at runtime; the benchmark harness uses it to detect and pin the
+    # BLAS thread count. Imported lazily so the package works without it.
+    "threadpoolctl>=3",
 ]
 
 # Single source of truth for the version: hatchling reads __version__ straight
