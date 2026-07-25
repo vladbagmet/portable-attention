@@ -19,8 +19,15 @@ from portable_attention import scaled_dot_product_attention
 
 
 def test_public_exports_are_frozen():
+    # The SDPA entry point and version SoT are the load-bearing surface; the
+    # backend-registry names are the M1 additive extension (the drop-in SDPA
+    # signature itself stays frozen to torch, verified below).
     assert set(portable_attention.__all__) == {
+        "SdpaBackend",
         "__version__",
+        "available_backends",
+        "get_backend",
+        "register_backend",
         "scaled_dot_product_attention",
     }
 

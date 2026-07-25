@@ -52,9 +52,30 @@ path on hardware where the fast vendor path is missing. The CPU reference
 implements the forward, non-dropout computation; `dropout_p` and `enable_gqa`
 are accepted for signature compatibility but must be left at their defaults (a
 non-default value raises `NotImplementedError` rather than being silently
-ignored). Only the names re-exported from the top-level package —
-`scaled_dot_product_attention` and `__version__` — are public; everything else
-is internal and may change.
+ignored). The public API is the set of names re-exported from the top-level
+package — `scaled_dot_product_attention`, `__version__`, and the backend-registry
+helpers `get_backend`, `available_backends`, `register_backend`, and the
+`SdpaBackend` protocol (see [Backends](#backends)); everything else is internal
+and may change.
+
+## Backends
+
+Attention runs through a small pluggable backend registry. The CPU `reference`
+implementation is the correctness oracle and is always available; every future
+backend is validated against its output. The public
+`scaled_dot_product_attention` dispatches to the `"auto"` backend (today that is
+always `reference`). To resolve a specific backend explicitly:
+
+```python
+from portable_attention import available_backends, get_backend
+
+print(available_backends())  # ['reference']
+out = get_backend("reference")(query, key, value)
+```
+
+A backend is any callable matching the `SdpaBackend` protocol (the same
+signature as `scaled_dot_product_attention`); register your own with
+`register_backend(name, backend)`.
 
 ## Development
 
