@@ -73,6 +73,14 @@ _RESERVED = frozenset({"auto"})
 _REGISTRY: dict[str, SdpaBackend] = {}
 
 
+def _reject_bad_registration(name: object, backend: object) -> None:
+    """Type-guard registration inputs for untyped callers."""
+    if not isinstance(name, str):
+        raise TypeError(f"backend name must be a string, got {type(name).__name__}.")
+    if not callable(backend):
+        raise TypeError("backend must be callable (an SdpaBackend).")
+
+
 def register_backend(
     name: str, backend: SdpaBackend, *, overwrite: bool = False
 ) -> None:
@@ -85,9 +93,13 @@ def register_backend(
             exists raises; pass ``True`` to replace it.
 
     Raises:
+        TypeError: If ``name`` is not a string or ``backend`` is not callable.
         ValueError: If ``name`` is empty, reserved, or already registered while
             ``overwrite`` is ``False``.
     """
+    # Guards accept ``object`` so they also protect untyped callers (the type
+    # annotations above only bind static callers).
+    _reject_bad_registration(name, backend)
     if not name:
         raise ValueError("backend name must be a non-empty string.")
     if name in _RESERVED:

@@ -120,6 +120,18 @@ def test_register_rejects_reserved_auto():
         register_backend("auto", get_backend("reference"))
 
 
+def test_register_rejects_non_string_name():
+    with pytest.raises(TypeError, match="must be a string"):
+        register_backend(123, get_backend("reference"))  # type: ignore[arg-type]
+    assert 123 not in _REGISTRY
+
+
+def test_register_rejects_non_callable_backend():
+    with pytest.raises(TypeError, match="must be callable"):
+        register_backend("bad", "not a backend")  # type: ignore[arg-type]
+    assert "bad" not in available_backends()
+
+
 def test_conformance_registered_backend_agrees_with_oracle():
     # A well-behaved backend (here a thin wrapper) must match the reference on
     # the same inputs — the contract every future backend is held to.

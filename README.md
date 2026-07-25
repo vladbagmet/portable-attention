@@ -52,9 +52,11 @@ path on hardware where the fast vendor path is missing. The CPU reference
 implements the forward, non-dropout computation; `dropout_p` and `enable_gqa`
 are accepted for signature compatibility but must be left at their defaults (a
 non-default value raises `NotImplementedError` rather than being silently
-ignored). Only the names re-exported from the top-level package —
-`scaled_dot_product_attention` and `__version__` — are public; everything else
-is internal and may change.
+ignored). The public API is the set of names re-exported from the top-level
+package — `scaled_dot_product_attention`, `__version__`, and the backend-registry
+helpers `get_backend`, `available_backends`, `register_backend`, and the
+`SdpaBackend` protocol (see [Backends](#backends)); everything else is internal
+and may change.
 
 ## Backends
 
