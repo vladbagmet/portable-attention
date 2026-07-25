@@ -67,7 +67,7 @@ always `reference`). To resolve a specific backend explicitly:
 ```python
 from portable_attention import available_backends, get_backend
 
-print(available_backends())          # ['reference']
+print(available_backends())  # ['reference']
 out = get_backend("reference")(query, key, value)
 ```
 
