@@ -174,6 +174,8 @@ def _limit_threads(num_threads: int | None) -> Generator[None, None, None]:
     policy). Otherwise ``threadpoolctl`` is used when present; failing that, the
     environment-variable fallback is applied.
     """
+    if num_threads is not None and num_threads < 1:
+        raise ValueError(f"num_threads must be >= 1, got {num_threads}")
     if num_threads is None:
         yield
         return
@@ -196,6 +198,8 @@ def _time_ms(fn: Callable[[], object], *, repeats: int, warmup: int) -> float:
     """Return the median wall-clock latency of ``fn`` in milliseconds."""
     if repeats < 1:
         raise ValueError("repeats must be >= 1")
+    if warmup < 0:
+        raise ValueError("warmup must be >= 0")
     for _ in range(warmup):
         fn()
     samples: list[float] = []
@@ -230,6 +234,13 @@ def benchmark_shape(
         seed: RNG seed for the synthetic inputs.
     """
     resolved = np.dtype(dtype)
+    if not np.issubdtype(resolved, np.floating):
+        raise ValueError(f"dtype must be a floating type, got {resolved.name!r}")
+    dims = tuple(shape)
+    if len(dims) != 4 or any(dim < 1 for dim in dims):
+        raise ValueError(
+            f"shape must be four positive dims (B, H, S, D), got {shape!r}"
+        )
     fn = get_backend(backend)
     query = _make_inputs(shape, resolved, seed)
     key = _make_inputs(shape, resolved, seed + 1)

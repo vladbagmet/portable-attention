@@ -129,6 +129,20 @@ def test_time_ms_requires_positive_repeats():
         benchmark._time_ms(lambda: None, repeats=0, warmup=0)
 
 
+def test_time_ms_rejects_negative_warmup():
+    with pytest.raises(ValueError, match="warmup"):
+        benchmark._time_ms(lambda: None, repeats=1, warmup=-1)
+
+
+def test_limit_threads_rejects_non_positive():
+    for bad in (0, -2):
+        with (
+            pytest.raises(ValueError, match="num_threads"),
+            benchmark._limit_threads(bad),
+        ):
+            pass
+
+
 def test_time_ms_counts_calls():
     counter = {"n": 0}
 
@@ -152,6 +166,21 @@ def test_benchmark_shape_returns_populated_result():
     assert result.repeats == 3
     assert result.latency_ms >= 0.0
     assert result.thread_label == "1"
+
+
+def test_benchmark_shape_rejects_non_floating_dtype():
+    with pytest.raises(ValueError, match="floating"):
+        benchmark_shape(TINY, threads=1, repeats=1, warmup=0, dtype="int32")
+
+
+def test_benchmark_shape_rejects_degenerate_shape():
+    with pytest.raises(ValueError, match="four positive dims"):
+        benchmark_shape((1, 0, 8, 4), threads=1, repeats=1, warmup=0)
+
+
+def test_benchmark_shape_rejects_non_positive_threads():
+    with pytest.raises(ValueError, match="num_threads"):
+        benchmark_shape(TINY, threads=0, repeats=1, warmup=0)
 
 
 def test_benchmark_shape_default_threads_label():
