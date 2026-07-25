@@ -77,6 +77,29 @@ A backend is any callable matching the `SdpaBackend` protocol (the same
 signature as `scaled_dot_product_attention`); register your own with
 `register_backend(name, backend)`.
 
+## CPU performance and BLAS threads
+
+Multi-head attention runs many small per-slice matrix multiplies through NumPy's
+batched `matmul`. Under the default OpenBLAS policy (one thread per core), the
+thread-synchronization overhead of those tiny GEMMs can dominate and make
+multi-head workloads **much** slower than with a single BLAS thread. Until the
+blocked CPU kernel lands, cap the BLAS thread count for multi-head work:
+
+```sh
+OPENBLAS_NUM_THREADS=1 python your_script.py
+```
+
+Dated, reproducible latency numbers (with the thread configuration recorded
+next to each result) live in `BENCHMARKS.md`. Regenerate them with the built-in
+harness:
+
+```sh
+python -m portable_attention.benchmark --threads 1 --commit "$(git rev-parse --short HEAD)"
+```
+
+Installing `threadpoolctl` lets the harness detect and pin the real BLAS thread
+count precisely; without it, it falls back to `OPENBLAS_NUM_THREADS`.
+
 ## Development
 
 ```sh
