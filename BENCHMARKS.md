@@ -15,9 +15,12 @@ python -m portable_attention.benchmark --threads 1 --commit "$(git rev-parse --s
 Multi-head attention issues many small per-slice GEMMs through NumPy's batched
 `matmul`. Under the default OpenBLAS policy (one thread per core) the
 thread-synchronization overhead of those tiny GEMMs dominates, so latency can be
-**15–25× worse** than with a single BLAS thread (issue #8). Until the planned
-blocked/streaming CPU kernel batches the head dimension into fewer, larger
-GEMMs, the practical guidance is to cap BLAS threads for multi-head workloads:
+**15–25× worse** than with a single BLAS thread (issue #8).
+
+The `fused` backend (`get_backend("fused")`) pins BLAS to one thread internally
+for batched inputs and computes in native precision, so multi-head attention no
+longer cliffs at default threads — see the newest block below. When calling the
+`reference` oracle directly, cap BLAS threads for multi-head workloads instead:
 
 ```sh
 OPENBLAS_NUM_THREADS=1 python your_script.py
@@ -30,6 +33,48 @@ default-threading cliff visible.
 
 Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 8 GB RAM, no discrete GPU).
+
+---
+
+## 2026-07-26 — commit e55387f — fused backend removes the default-thread cliff
+
+**Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1 (scipy-openblas
+0.3.33). portable-attention 0.0.1. `threadpoolctl` 3.6.0.
+
+**BLAS threads (process default, via threadpoolctl):** openblas=4. Both backends
+are measured at the **process-default** thread count (nothing pinned by the
+harness) — this is what a user gets out of the box, and where the reference
+multi-head cliff appears. The `fused` backend pins BLAS to one thread internally
+for batched (multi-slice) inputs; `reference` does not.
+
+Reproduce this block with the harness API (the `--threads 1` CLI at the top of
+this file pins BLAS and measures the pinned suite instead):
+
+```python
+from portable_attention.benchmark import benchmark_shape
+
+for backend in ("reference", "fused"):
+    r = benchmark_shape((2, 8, 256, 64), threads=None, backend=backend, repeats=30)
+    print(backend, r.latency_ms)
+```
+
+### Reference vs fused at default OpenBLAS threads (median over 30 repeats)
+
+| shape (B,H,S,D)   | dtype   | reference | fused     | speedup |
+|-------------------|---------|----------:|----------:|--------:|
+| (1, 1, 64, 32)    | float32 |  0.171 ms |  0.119 ms |   1.44× |
+| (1, 8, 128, 64)   | float32 |  6.518 ms |  3.388 ms |   1.92× |
+| (2, 8, 256, 64)   | float32 | 122.04 ms | 24.910 ms |   4.90× |
+| (1, 12, 512, 64)  | float32 | 289.71 ms | 79.437 ms |   3.65× |
+| (4, 16, 256, 64)  | float32 | 365.32 ms | 107.30 ms |   3.40× |
+
+The multi-head shapes no longer cliff at default threads: `fused` is 1.9–4.9×
+faster than the `reference` oracle without the caller needing to touch
+`OPENBLAS_NUM_THREADS`. The single-slice `(1,1,64,32)` case is left unpinned
+(pinning a lone sub-millisecond GEMM is not worth the thread-pool reset cost),
+so it is still slightly faster purely from native-precision compute. Absolute
+numbers are noisy on a shared low-power board; the cross-backend ratios are the
+stable signal.
 
 ---
 
