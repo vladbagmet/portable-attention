@@ -33,6 +33,7 @@ import importlib.util
 from collections.abc import Generator
 from contextlib import contextmanager
 from types import ModuleType
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -136,9 +137,14 @@ def scaled_dot_product_attention(
             f"key/value sequence dims differ: {key.shape[-2]} vs {value.shape[-2]}."
         )
 
-    # Compute in the input's own precision, promoting float16 to float32 so the
-    # softmax stays numerically safe. float32/float64 are preserved as-is.
-    compute_dtype = np.result_type(query.dtype, np.float32)
+    # Compute in the widest floating precision among all operands (query, key,
+    # value, and an additive mask), promoting float16 up to float32 so the
+    # softmax stays numerically safe. This preserves precision for mixed-dtype
+    # inputs instead of silently downcasting to query's dtype.
+    operand_dtypes: list[np.dtype[Any]] = [query.dtype, key.dtype, value.dtype]
+    if attn_mask is not None and attn_mask.dtype != np.bool_:
+        operand_dtypes.append(attn_mask.dtype)
+    compute_dtype = np.result_type(*operand_dtypes, np.float32)
     q = query.astype(compute_dtype, copy=False)
     k = key.astype(compute_dtype, copy=False)
     v = value.astype(compute_dtype, copy=False)

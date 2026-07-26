@@ -142,6 +142,31 @@ def test_float16_input_is_promoted_and_matches_reference() -> None:
     )
 
 
+def test_mixed_dtype_preserves_widest_precision_and_matches_reference() -> None:
+    # query float32 but value float64: compute must not downcast value's
+    # precision. Output dtype follows query (float32), matching the reference.
+    rng = np.random.default_rng(3)
+    q = rng.standard_normal((2, 4, 6, 8)).astype(np.float32)
+    k = rng.standard_normal((2, 4, 6, 8)).astype(np.float64)
+    v = rng.standard_normal((2, 4, 6, 4)).astype(np.float64)
+    out = fused(q, k, v)
+    assert out.dtype == np.dtype(np.float32)
+    np.testing.assert_allclose(out, reference(q, k, v), **_TOL[np.dtype(np.float32)])
+
+
+def test_higher_precision_additive_mask_is_not_downcast() -> None:
+    rng = np.random.default_rng(4)
+    q = rng.standard_normal((2, 5, 8)).astype(np.float32)
+    k = rng.standard_normal((2, 7, 8)).astype(np.float32)
+    v = rng.standard_normal((2, 7, 4)).astype(np.float32)
+    bias = rng.standard_normal((5, 7)).astype(np.float64)
+    out = fused(q, k, v, attn_mask=bias)
+    assert out.dtype == np.dtype(np.float32)
+    np.testing.assert_allclose(
+        out, reference(q, k, v, attn_mask=bias), **_TOL[np.dtype(np.float32)]
+    )
+
+
 def test_fully_masked_rows_are_exact_zero() -> None:
     q, k, v = _inputs((3, 5, 8), (3, 7, 8), (3, 7, 4), np.dtype(np.float32))
     mask = np.ones((3, 5, 7), dtype=bool)

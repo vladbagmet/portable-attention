@@ -19,9 +19,10 @@ The special name ``"auto"`` resolves to the best backend currently available
 where the selection policy will live.
 
 The CPU ``fused`` backend computes the same forward attention as ``reference``
-but in the input's native precision with BLAS pinned to a single thread, which
-removes the multi-head latency cliff the reference hits under default OpenBLAS
-threading (issue #8). Select it with ``get_backend("fused")``.
+but in the input's native precision, with BLAS pinned to a single thread for
+batched (multi-slice) inputs, which removes the multi-head latency cliff the
+reference hits under default OpenBLAS threading (issue #8). Select it with
+``get_backend("fused")``.
 """
 
 from __future__ import annotations

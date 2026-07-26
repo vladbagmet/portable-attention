@@ -47,6 +47,17 @@ harness) — this is what a user gets out of the box, and where the reference
 multi-head cliff appears. The `fused` backend pins BLAS to one thread internally
 for batched (multi-slice) inputs; `reference` does not.
 
+Reproduce this block with the harness API (the `--threads 1` CLI at the top of
+this file pins BLAS and measures the pinned suite instead):
+
+```python
+from portable_attention.benchmark import benchmark_shape
+
+for backend in ("reference", "fused"):
+    r = benchmark_shape((2, 8, 256, 64), threads=None, backend=backend, repeats=30)
+    print(backend, r.latency_ms)
+```
+
 ### Reference vs fused at default OpenBLAS threads (median over 30 repeats)
 
 | shape (B,H,S,D)   | dtype   | reference | fused     | speedup |
