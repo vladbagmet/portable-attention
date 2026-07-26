@@ -69,8 +69,18 @@ always `reference`). To resolve a specific backend explicitly:
 ```python
 from portable_attention import available_backends, get_backend
 
-print(available_backends())  # ['reference']
+print(available_backends())  # ['fused', 'reference']
 out = get_backend("reference")(query, key, value)
+```
+
+The `fused` backend computes the same forward attention as `reference` but in
+the input's native precision with BLAS pinned to a single thread. It matches the
+reference to floating tolerance and is much faster for multi-head workloads at
+default OpenBLAS threads (see [CPU performance and BLAS
+threads](#cpu-performance-and-blas-threads)):
+
+```python
+out = get_backend("fused")(query, key, value)
 ```
 
 A backend is any callable matching the `SdpaBackend` protocol (the same
@@ -82,8 +92,21 @@ signature as `scaled_dot_product_attention`); register your own with
 Multi-head attention runs many small per-slice matrix multiplies through NumPy's
 batched `matmul`. Under the default OpenBLAS policy (one thread per core), the
 thread-synchronization overhead of those tiny GEMMs can dominate and make
-multi-head workloads **much** slower than with a single BLAS thread. Until the
-blocked CPU kernel lands, cap the BLAS thread count for multi-head work:
+multi-head workloads **much** slower than with a single BLAS thread.
+
+The `fused` backend handles this for you: it pins BLAS to one thread for its
+compute region (via `threadpoolctl` when installed) and computes in native
+precision, so multi-head attention does not cliff at default OpenBLAS threads.
+Prefer it for performance:
+
+```python
+from portable_attention import get_backend
+
+out = get_backend("fused")(query, key, value)
+```
+
+If you call the `reference` backend directly (the correctness oracle, which
+upcasts to float64), cap the BLAS thread count yourself for multi-head work:
 
 ```sh
 OPENBLAS_NUM_THREADS=1 python your_script.py

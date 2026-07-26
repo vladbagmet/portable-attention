@@ -17,6 +17,11 @@ backend explicitly, resolve it and call it directly::
 The special name ``"auto"`` resolves to the best backend currently available
 (today that is always ``"reference"``); as vendor backends land, ``"auto"`` is
 where the selection policy will live.
+
+The CPU ``fused`` backend computes the same forward attention as ``reference``
+but in the input's native precision with BLAS pinned to a single thread, which
+removes the multi-head latency cliff the reference hits under default OpenBLAS
+threading (issue #8). Select it with ``get_backend("fused")``.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from .fused import scaled_dot_product_attention as _fused_sdpa
 from .reference import scaled_dot_product_attention as _reference_sdpa
 
 __all__ = [
@@ -187,5 +193,7 @@ def scaled_dot_product_attention(
     )
 
 
-# The reference backend is the correctness oracle and is always available.
+# The reference backend is the correctness oracle and is always available; the
+# fused backend is the fast, dtype-preserving CPU path validated against it.
 register_backend("reference", _reference_sdpa)
+register_backend("fused", _fused_sdpa)
