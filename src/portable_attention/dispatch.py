@@ -14,14 +14,18 @@ backend explicitly, resolve it and call it directly::
 
     out = get_backend("reference")(query, key, value)
 
-The special name ``"auto"`` resolves to the best backend currently available
-(today that is always ``"reference"``); as vendor backends land, ``"auto"`` is
-where the selection policy will live.
+The special name ``"auto"`` resolves to a shape-aware policy rather than a
+fixed backend: it inspects each call's ``query`` and routes *batched*
+(multi-slice) inputs to the fast CPU ``fused`` backend while keeping
+single-slice inputs on the ``reference`` oracle path (where the two perform
+equivalently). This is where the selection policy lives as vendor backends
+land.
 
 The CPU ``fused`` backend computes the same forward attention as ``reference``
 but in the input's native precision, with BLAS pinned to a single thread for
 batched (multi-slice) inputs, which removes the multi-head latency cliff the
-reference hits under default OpenBLAS threading (issue #8). Select it with
+reference hits under default OpenBLAS threading (issue #8). ``"auto"`` selects
+it automatically for batched work; select it unconditionally with
 ``get_backend("fused")``.
 """
 
@@ -72,9 +76,6 @@ class SdpaBackend(Protocol):
         ...
 
 
-# Name of the backend that ``"auto"`` resolves to. Kept as a plain constant for
-# now; when vendor backends land this becomes a capability-based policy.
-_AUTO_TARGET = "reference"
 _RESERVED = frozenset({"auto"})
 
 _REGISTRY: dict[str, SdpaBackend] = {}
@@ -124,22 +125,88 @@ def available_backends() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def _is_batched(query: object) -> bool:
+    """Return ``True`` when ``query`` has more than one batched GEMM slice.
+
+    Mirrors the fused backend's slice count: the product of all leading
+    (non-matrix) dimensions. Anything without a usable numeric shape (an
+    untyped caller, or a 0/1/2-D input) counts as *not* batched, so the policy
+    stays conservative and the chosen backend performs its own input
+    validation.
+    """
+    shape = getattr(query, "shape", None)
+    if shape is None:
+        return False
+    try:
+        return len(shape) >= 3 and int(np.prod(shape[:-2])) > 1
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _auto_select(query: object) -> SdpaBackend:
+    """Return the backend the ``"auto"`` policy picks for ``query``.
+
+    The ``fused`` backend removes the multi-head OpenBLAS latency cliff
+    (issue #8) on batched (multi-slice) inputs, so ``"auto"`` routes those to it
+    when it is registered. Single-slice inputs — where the two backends perform
+    equivalently — stay on the ``reference`` oracle path. If ``fused`` is not
+    registered (e.g. it was unregistered), ``"auto"`` always falls back to
+    ``reference``.
+    """
+    fused = _REGISTRY.get("fused")
+    if fused is not None and _is_batched(query):
+        return fused
+    return _REGISTRY["reference"]
+
+
+def _auto_dispatch(
+    query: Array,
+    key: Array,
+    value: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Array:
+    """The ``"auto"`` backend: pick a backend per call and delegate to it.
+
+    Selection is driven by :func:`_auto_select` (batched inputs go to the fast
+    ``fused`` backend, single-slice inputs to the ``reference`` oracle). The
+    arguments are forwarded unchanged, so the observable contract is identical
+    to calling the selected backend directly.
+    """
+    return _auto_select(query)(
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
 def get_backend(name: str = "auto") -> SdpaBackend:
     """Resolve a backend by name.
 
     Args:
-        name: A registered backend name, or ``"auto"`` (default) to select the
-            best currently available backend.
+        name: A registered backend name, or ``"auto"`` (default) for the
+            shape-aware policy that selects the best backend per call.
 
     Returns:
-        The backend callable.
+        The backend callable. For ``"auto"`` this is a stable dispatcher that
+        chooses a concrete backend on each call from the input shape.
 
     Raises:
         ValueError: If ``name`` is not a known backend.
     """
-    resolved = _AUTO_TARGET if name == "auto" else name
+    if name == "auto":
+        return _auto_dispatch
     try:
-        return _REGISTRY[resolved]
+        return _REGISTRY[name]
     except KeyError:
         raise ValueError(
             f"unknown backend {name!r}; available: {available_backends()}"
@@ -162,8 +229,9 @@ def scaled_dot_product_attention(
     This is the package's public entry point. Its signature mirrors
     ``torch.nn.functional.scaled_dot_product_attention`` so it can act as a
     drop-in on hardware where the fast vendor path is missing. The call is
-    dispatched to the ``"auto"`` backend (currently the CPU ``reference``
-    implementation); to force a specific backend, use
+    dispatched to the ``"auto"`` backend, whose shape-aware policy routes
+    batched inputs to the fast CPU ``fused`` backend and single-slice inputs to
+    the CPU ``reference`` implementation; to force a specific backend, use
     ``get_backend(name)(...)`` directly.
 
     See the reference backend for the full parameter and error contract; this
