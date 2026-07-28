@@ -63,8 +63,10 @@ and may change.
 Attention runs through a small pluggable backend registry. The CPU `reference`
 implementation is the correctness oracle and is always available; every future
 backend is validated against its output. The public
-`scaled_dot_product_attention` dispatches to the `"auto"` backend (today that is
-always `reference`). To resolve a specific backend explicitly:
+`scaled_dot_product_attention` dispatches to the `"auto"` backend, a shape-aware
+policy that routes batched (multi-slice) inputs to the fast `fused` backend and
+single-slice inputs to the `reference` oracle — so multi-head workloads get the
+fast path automatically. To resolve a specific backend explicitly:
 
 ```python
 from portable_attention import available_backends, get_backend
@@ -94,9 +96,10 @@ batched `matmul`. Under the default OpenBLAS policy (one thread per core), the
 thread-synchronization overhead of those tiny GEMMs can dominate and make
 multi-head workloads **much** slower than with a single BLAS thread.
 
-The `fused` backend handles this for you: for batched (multi-slice) inputs it
-pins BLAS to one thread for its compute region (via `threadpoolctl` when
-installed) and computes in native precision, so multi-head attention does not
+The `fused` backend handles this for you (and `"auto"` selects it automatically
+for batched inputs): for batched (multi-slice) inputs it pins BLAS to one thread
+for its compute region (via `threadpoolctl` when installed) and computes in
+native precision, so multi-head attention does not
 cliff at default OpenBLAS threads. Prefer it for performance:
 
 ```python
