@@ -98,6 +98,20 @@ def test_auto_is_safe_for_inputs_without_shape():
     assert _auto_select(object()) is get_backend("reference")
 
 
+class _BadShape:
+    """Stand-in for an untyped input whose ``.shape`` is malformed."""
+
+    def __init__(self, shape: object) -> None:
+        self.shape = shape
+
+
+@pytest.mark.parametrize("shape", [0, (None, 5, 8), "nope", ("a", "b", "c")])
+def test_auto_is_safe_for_malformed_shape(shape: object):
+    # A ``.shape`` that ``len``/``np.prod`` can't handle must fall back to the
+    # reference backend, not crash selection.
+    assert _auto_select(_BadShape(shape)) is get_backend("reference")
+
+
 def test_reference_backend_satisfies_protocol():
     assert isinstance(get_backend("reference"), SdpaBackend)
 

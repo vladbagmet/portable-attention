@@ -135,9 +135,12 @@ def _is_batched(query: object) -> bool:
     validation.
     """
     shape = getattr(query, "shape", None)
-    if shape is None or len(shape) < 3:
+    if shape is None:
         return False
-    return int(np.prod(shape[:-2])) > 1
+    try:
+        return len(shape) >= 3 and int(np.prod(shape[:-2])) > 1
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _auto_select(query: object) -> SdpaBackend:
