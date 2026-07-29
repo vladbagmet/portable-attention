@@ -87,9 +87,21 @@ def test_unsupported_dropout_raises():
         scaled_dot_product_attention(q, k, v, dropout_p=0.1)
 
 
-def test_unsupported_gqa_raises():
+def test_gqa_without_head_dim_raises():
+    # enable_gqa needs a head axis; 2-D inputs have nothing to group over.
     q = np.zeros((2, 4))
     k = np.zeros((3, 4))
     v = np.zeros((3, 5))
-    with pytest.raises(NotImplementedError, match="enable_gqa"):
+    with pytest.raises(ValueError, match="head dimension"):
         scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+def test_gqa_runs_end_to_end():
+    # Grouped-query attention through the public entry point: 8 query heads
+    # share 2 key/value heads, output keeps the query head count.
+    rng = np.random.default_rng(12)
+    q = rng.standard_normal((2, 8, 5, 16))
+    k = rng.standard_normal((2, 2, 7, 16))
+    v = rng.standard_normal((2, 2, 7, 4))
+    out = scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    assert out.shape == (2, 8, 5, 4)

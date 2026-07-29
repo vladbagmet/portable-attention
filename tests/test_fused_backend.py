@@ -182,9 +182,50 @@ def test_rejects_dropout() -> None:
         fused(q, k, v, dropout_p=0.1)
 
 
-def test_rejects_enable_gqa() -> None:
-    q, k, v = _inputs((2, 4, 8), (2, 4, 8), (2, 4, 8), np.dtype(np.float32))
-    with pytest.raises(NotImplementedError, match="enable_gqa"):
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_heads,kv_heads", [(8, 2), (6, 3), (4, 4)])
+def test_gqa_matches_reference(
+    dtype: type[np.floating], q_heads: int, kv_heads: int
+) -> None:
+    dt = np.dtype(dtype)
+    q, k, v = _inputs((2, q_heads, 5, 8), (2, kv_heads, 7, 8), (2, kv_heads, 7, 4), dt)
+    out = fused(q, k, v, enable_gqa=True)
+    assert out.shape == (2, q_heads, 5, 4)
+    assert out.dtype == dt
+    np.testing.assert_allclose(out, reference(q, k, v, enable_gqa=True), **_TOL[dt])
+
+
+def test_gqa_causal_matches_reference() -> None:
+    q, k, v = _inputs((2, 8, 6, 8), (2, 2, 6, 8), (2, 2, 6, 4), np.dtype(np.float64))
+    out = fused(q, k, v, is_causal=True, enable_gqa=True)
+    np.testing.assert_allclose(
+        out,
+        reference(q, k, v, is_causal=True, enable_gqa=True),
+        **_TOL[np.dtype(np.float64)],
+    )
+
+
+def test_gqa_requires_head_dimension() -> None:
+    q, k, v = _inputs((5, 8), (7, 8), (7, 4), np.dtype(np.float32))
+    with pytest.raises(ValueError, match="head dimension"):
+        fused(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_non_multiple_head_counts() -> None:
+    q, k, v = _inputs((2, 8, 5, 8), (2, 3, 7, 8), (2, 3, 7, 4), np.dtype(np.float32))
+    with pytest.raises(ValueError, match="positive multiple"):
+        fused(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_key_value_head_mismatch() -> None:
+    q, k, v = _inputs((2, 8, 5, 8), (2, 2, 7, 8), (2, 4, 7, 4), np.dtype(np.float32))
+    with pytest.raises(ValueError, match="key/value head dims differ"):
+        fused(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_zero_query_heads() -> None:
+    q, k, v = _inputs((2, 0, 5, 8), (2, 2, 7, 8), (2, 2, 7, 4), np.dtype(np.float32))
+    with pytest.raises(ValueError, match="positive multiple"):
         fused(q, k, v, enable_gqa=True)
 
 

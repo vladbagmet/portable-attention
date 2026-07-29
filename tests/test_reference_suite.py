@@ -24,6 +24,9 @@ import pytest
 from numpy.typing import NDArray
 
 from portable_attention import scaled_dot_product_attention
+from portable_attention.reference import (
+    scaled_dot_product_attention as reference,
+)
 
 # Tolerances: float64 is compared tightly; float32 inputs are computed by the
 # reference in float64 then cast back, so the cast dominates the error budget.
@@ -199,6 +202,98 @@ def test_fully_masked_rows_are_finite_zero(dtype):
     # Fully-masked rows are exactly zero, not merely close to it.
     np.testing.assert_array_equal(out[0], np.zeros_like(out[0]))
     np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
+
+
+# (H_q, H_kv) grouped-query head pairs: H_q a positive multiple of H_kv,
+# including the degenerate equal-heads (group size 1) case.
+_GQA_HEADS = [(8, 2), (6, 3), (4, 1), (4, 4)]
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEADS)
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_gqa_matches_expanded_kv_oracle(q_heads, kv_heads, dtype):
+    # Grouped-query attention must equal plain attention on key/value whose
+    # heads have been repeated (np.repeat along the head axis) up to the query
+    # head count -- the torch repeat_interleave grouping.
+    rng = np.random.default_rng(900 + q_heads * 17 + kv_heads)
+    q = _randn(rng, (2, q_heads, 5, 8), dtype)
+    k = _randn(rng, (2, kv_heads, 7, 8), dtype)
+    v = _randn(rng, (2, kv_heads, 7, 4), dtype)
+    repeats = q_heads // kv_heads
+    k_exp = np.repeat(k, repeats, axis=-3)
+    v_exp = np.repeat(v, repeats, axis=-3)
+
+    out = scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    expected = _oracle(q, k_exp, v_exp, None, False, None)
+
+    assert out.shape == (2, q_heads, 5, 4)
+    assert out.dtype == np.dtype(dtype)
+    np.testing.assert_allclose(out, expected, **_TOL[np.dtype(dtype)])
+
+
+def test_gqa_causal_matches_expanded_kv():
+    # Grouped-query attention composes with is_causal: the result matches a
+    # causal pass over the head-expanded key/value.
+    rng = np.random.default_rng(913)
+    q = _randn(rng, (2, 8, 6, 8), np.float64)
+    k = _randn(rng, (2, 2, 6, 8), np.float64)
+    v = _randn(rng, (2, 2, 6, 4), np.float64)
+    k_exp = np.repeat(k, 4, axis=-3)
+    v_exp = np.repeat(v, 4, axis=-3)
+
+    out = scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+    expected = scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+
+    np.testing.assert_allclose(out, expected, rtol=1e-11, atol=1e-11)
+
+
+def test_gqa_requires_head_dimension():
+    # Without a head axis (2-D inputs) there is nothing to group over.
+    q = np.zeros((5, 8))
+    k = np.zeros((7, 8))
+    v = np.zeros((7, 4))
+    with pytest.raises(ValueError, match="head dimension"):
+        scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_non_multiple_head_counts():
+    # Call the reference backend directly: batched inputs would otherwise route
+    # through the shape-aware "auto" policy to the fused backend, leaving the
+    # reference oracle's own guard unexercised.
+    rng = np.random.default_rng(921)
+    q = _randn(rng, (2, 8, 5, 8), np.float64)
+    k = _randn(rng, (2, 3, 7, 8), np.float64)
+    v = _randn(rng, (2, 3, 7, 4), np.float64)
+    with pytest.raises(ValueError, match="positive multiple"):
+        reference(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_zero_key_value_heads():
+    # A zero-head key/value hits the k_heads == 0 guard (before the modulo).
+    q = np.zeros((2, 4, 5, 8))
+    k = np.zeros((2, 0, 7, 8))
+    v = np.zeros((2, 0, 7, 4))
+    with pytest.raises(ValueError, match="positive multiple"):
+        reference(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_zero_query_heads():
+    # Zero query heads satisfies the modulo check but the contract requires a
+    # positive head count; it must raise rather than emit an empty output.
+    q = np.zeros((2, 0, 5, 8))
+    k = np.zeros((2, 2, 7, 8))
+    v = np.zeros((2, 2, 7, 4))
+    with pytest.raises(ValueError, match="positive multiple"):
+        reference(q, k, v, enable_gqa=True)
+
+
+def test_gqa_rejects_key_value_head_mismatch():
+    rng = np.random.default_rng(922)
+    q = _randn(rng, (2, 8, 5, 8), np.float64)
+    k = _randn(rng, (2, 2, 7, 8), np.float64)
+    v = _randn(rng, (2, 4, 7, 4), np.float64)
+    with pytest.raises(ValueError, match="key/value head dims differ"):
+        reference(q, k, v, enable_gqa=True)
 
 
 def test_causal_first_row_is_first_value():
