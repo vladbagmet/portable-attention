@@ -72,7 +72,7 @@ def _expand_kv_for_gqa(query: Array, key: Array, value: Array) -> tuple[Array, A
     k_heads = key.shape[-3]
     if k_heads != value.shape[-3]:
         raise ValueError(f"key/value head dims differ: {k_heads} vs {value.shape[-3]}.")
-    if k_heads == 0 or q_heads % k_heads != 0:
+    if q_heads == 0 or k_heads == 0 or q_heads % k_heads != 0:
         raise ValueError(
             f"query head count {q_heads} must be a positive multiple of the "
             f"key/value head count {k_heads} for grouped-query attention."

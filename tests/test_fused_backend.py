@@ -223,6 +223,12 @@ def test_gqa_rejects_key_value_head_mismatch() -> None:
         fused(q, k, v, enable_gqa=True)
 
 
+def test_gqa_rejects_zero_query_heads() -> None:
+    q, k, v = _inputs((2, 0, 5, 8), (2, 2, 7, 8), (2, 2, 7, 4), np.dtype(np.float32))
+    with pytest.raises(ValueError, match="positive multiple"):
+        fused(q, k, v, enable_gqa=True)
+
+
 def test_rejects_causal_with_mask() -> None:
     q, k, v = _inputs((4, 4, 8), (4, 4, 8), (4, 4, 8), np.dtype(np.float32))
     mask = np.ones((4, 4), dtype=bool)

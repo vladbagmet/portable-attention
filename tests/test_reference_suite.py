@@ -277,6 +277,16 @@ def test_gqa_rejects_zero_key_value_heads():
         reference(q, k, v, enable_gqa=True)
 
 
+def test_gqa_rejects_zero_query_heads():
+    # Zero query heads satisfies the modulo check but the contract requires a
+    # positive head count; it must raise rather than emit an empty output.
+    q = np.zeros((2, 0, 5, 8))
+    k = np.zeros((2, 2, 7, 8))
+    v = np.zeros((2, 2, 7, 4))
+    with pytest.raises(ValueError, match="positive multiple"):
+        reference(q, k, v, enable_gqa=True)
+
+
 def test_gqa_rejects_key_value_head_mismatch():
     rng = np.random.default_rng(922)
     q = _randn(rng, (2, 8, 5, 8), np.float64)
