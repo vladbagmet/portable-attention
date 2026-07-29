@@ -48,11 +48,12 @@ The signature matches
 [`torch.nn.functional.scaled_dot_product_attention`](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
 (`query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, *,
 scale=None, enable_gqa=False`), so it can act as a drop-in for the inference
-path on hardware where the fast vendor path is missing. The CPU reference
-implements the forward, non-dropout computation; `dropout_p` and `enable_gqa`
-are accepted for signature compatibility but must be left at their defaults (a
-non-default value raises `NotImplementedError` rather than being silently
-ignored). The public API is the set of names re-exported from the top-level
+path on hardware where the fast vendor path is missing. The CPU backends
+implement the forward, non-dropout computation, including grouped-query
+attention: pass `enable_gqa=True` when `key`/`value` carry fewer heads than
+`query` (their heads are repeated to match). `dropout_p` is accepted for
+signature compatibility but must be left at `0.0` (a non-zero value raises
+`NotImplementedError` rather than being silently ignored). The public API is the set of names re-exported from the top-level
 package — `scaled_dot_product_attention`, `__version__`, and the backend-registry
 helpers `get_backend`, `available_backends`, `register_backend`, and the
 `SdpaBackend` protocol (see [Backends](#backends)); everything else is internal

@@ -245,7 +245,8 @@ def scaled_dot_product_attention(
         dropout_p: Attention dropout probability (only ``0.0`` is supported).
         is_causal: Apply a causal mask. Mutually exclusive with ``attn_mask``.
         scale: Softmax scale (keyword-only). Defaults to ``1 / sqrt(E)``.
-        enable_gqa: Grouped-query attention (not yet supported).
+        enable_gqa: Enable grouped-query attention (repeat key/value heads to
+            match query heads before attention).
 
     Returns:
         The attention output of shape ``(*, L, Ev)``.
