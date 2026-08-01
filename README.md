@@ -105,8 +105,8 @@ before relying on it:
 ```python
 from portable_attention import assert_conforms, check_backend
 
-assert_conforms(my_backend)            # raises with the failing cases, or passes
-results = check_backend(my_backend)    # structured per-case results to inspect
+assert_conforms(my_backend)  # raises with the failing cases, or passes
+results = check_backend(my_backend)  # structured per-case results to inspect
 ```
 
 `conformance_cases()` returns the case list as data, so you can parametrize a
