@@ -130,6 +130,18 @@ def test_runner_flags_non_finite_output() -> None:
     assert "non-finite" in result.detail
 
 
+def test_runner_flags_backend_that_raises() -> None:
+    # A backend that raises on a valid case is a conformance failure, not a
+    # crash of the runner: it must be captured as a failed result.
+    def exploder(query, key, value, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    result = check_case(exploder, _SIMPLE_CASE)
+    assert not result.passed
+    assert "backend raised RuntimeError" in result.detail
+    assert "boom" in result.detail
+
+
 def test_runner_flags_value_mismatch() -> None:
     reference = get_backend("reference")
 

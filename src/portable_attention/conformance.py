@@ -258,13 +258,18 @@ def check_case(backend: Backend, case: ConformanceCase) -> ConformanceResult:
     inputs and keyword arguments. The backend passes the case when its output
     matches the oracle in shape, dtype, and value (to a dtype-appropriate
     tolerance), stays finite, and reproduces the oracle's exact zeros for
-    fully-masked rows. This never raises for an ordinary mismatch; it records
-    the reason in the result so a caller can report every failure at once.
+    fully-masked rows. This never raises for a nonconforming backend — an
+    ordinary mismatch, or an exception raised by the backend on a valid case, is
+    recorded as a failed result so a caller can report every failure at once.
+    (Errors from the oracle itself still propagate: those are kit bugs.)
     """
     query, key, value = case.make_inputs()
     kwargs = dict(case.kwargs)
     want = _oracle(query, key, value, **kwargs)
-    got = backend(query, key, value, **kwargs)
+    try:
+        got = backend(query, key, value, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - any raise on a valid case fails it
+        return _describe(case, f"backend raised {type(exc).__name__}: {exc}")
 
     if got.shape != want.shape:
         return _describe(case, f"shape {got.shape} != oracle {want.shape}")

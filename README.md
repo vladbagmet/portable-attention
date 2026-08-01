@@ -53,11 +53,13 @@ implement the forward, non-dropout computation, including grouped-query
 attention: pass `enable_gqa=True` when `key`/`value` carry fewer heads than
 `query` (their heads are repeated to match). `dropout_p` is accepted for
 signature compatibility but must be left at `0.0` (a non-zero value raises
-`NotImplementedError` rather than being silently ignored). The public API is the set of names re-exported from the top-level
-package — `scaled_dot_product_attention`, `__version__`, and the backend-registry
-helpers `get_backend`, `available_backends`, `register_backend`, and the
-`SdpaBackend` protocol (see [Backends](#backends)); everything else is internal
-and may change.
+`NotImplementedError` rather than being silently ignored). The public API is the
+set of names re-exported from the top-level package (its `__all__`):
+`scaled_dot_product_attention`, `__version__`, the backend-registry helpers
+`get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
+protocol, and the conformance kit `assert_conforms`, `check_backend`,
+`conformance_cases`, `ConformanceCase`, and `ConformanceResult` (see
+[Backends](#backends)); everything else is internal and may change.
 
 ## Backends
 

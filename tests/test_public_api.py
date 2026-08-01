@@ -37,6 +37,14 @@ def test_public_exports_are_frozen():
     }
 
 
+def test_every_exported_name_is_bound():
+    # A name can be listed in ``__all__`` yet be missing from the module (a typo
+    # in the export list), which breaks ``from portable_attention import *`` and
+    # top-level attribute access. Verify each declared export actually resolves.
+    for name in portable_attention.__all__:
+        assert hasattr(portable_attention, name), f"{name!r} is exported but unbound"
+
+
 def test_version_is_nonempty_string():
     assert isinstance(portable_attention.__version__, str)
     assert portable_attention.__version__
