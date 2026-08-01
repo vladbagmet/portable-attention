@@ -53,11 +53,13 @@ implement the forward, non-dropout computation, including grouped-query
 attention: pass `enable_gqa=True` when `key`/`value` carry fewer heads than
 `query` (their heads are repeated to match). `dropout_p` is accepted for
 signature compatibility but must be left at `0.0` (a non-zero value raises
-`NotImplementedError` rather than being silently ignored). The public API is the set of names re-exported from the top-level
-package — `scaled_dot_product_attention`, `__version__`, and the backend-registry
-helpers `get_backend`, `available_backends`, `register_backend`, and the
-`SdpaBackend` protocol (see [Backends](#backends)); everything else is internal
-and may change.
+`NotImplementedError` rather than being silently ignored). The public API is the
+set of names re-exported from the top-level package (its `__all__`):
+`scaled_dot_product_attention`, `__version__`, the backend-registry helpers
+`get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
+protocol, and the conformance kit `assert_conforms`, `check_backend`,
+`conformance_cases`, `ConformanceCase`, and `ConformanceResult` (see
+[Backends](#backends)); everything else is internal and may change.
 
 ## Backends
 
@@ -89,6 +91,29 @@ out = get_backend("fused")(query, key, value)
 A backend is any callable matching the `SdpaBackend` protocol (the same
 signature as `scaled_dot_product_attention`); register your own with
 `register_backend(name, backend)`.
+
+### Conformance kit
+
+The portability promise is *developer parity*: code written against
+`scaled_dot_product_attention` behaves the same on every backend. The shared
+conformance kit makes that executable — it checks a backend against the
+`reference` oracle across the full contract matrix (leading dims, non-square
+scores, all supported dtypes, `scale`, causal and boolean/additive masks,
+fully-masked rows, and grouped-query attention), verifying matching shape,
+preserved `query` dtype, finite output, and exact zeros for fully-masked rows.
+Every registered backend is held to it in CI; run it against your own backend
+before relying on it:
+
+```python
+from portable_attention import assert_conforms, check_backend
+
+assert_conforms(my_backend)  # raises with the failing cases, or passes
+results = check_backend(my_backend)  # structured per-case results to inspect
+```
+
+`conformance_cases()` returns the case list as data, so you can parametrize a
+test suite over it (`ConformanceCase` / `ConformanceResult` are the public
+types).
 
 ## CPU performance and BLAS threads
 

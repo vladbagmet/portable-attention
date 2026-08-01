@@ -10,11 +10,22 @@ may change without notice.
 Backends are pluggable: the CPU ``reference`` implementation is the correctness
 oracle and is always registered. Select a backend explicitly with
 :func:`get_backend`; the public :func:`scaled_dot_product_attention` keeps a
-torch-compatible signature and dispatches to the ``"auto"`` backend.
+torch-compatible signature and dispatches to the ``"auto"`` backend. Every
+backend must pass the shared conformance kit (:func:`assert_conforms`,
+:func:`check_backend`, :func:`conformance_cases`), which pins the
+developer-parity promise: identical behaviour against the reference oracle
+across the documented contract matrix.
 """
 
 from __future__ import annotations
 
+from .conformance import (
+    ConformanceCase,
+    ConformanceResult,
+    assert_conforms,
+    check_backend,
+    conformance_cases,
+)
 from .dispatch import (
     SdpaBackend,
     available_backends,
@@ -24,9 +35,14 @@ from .dispatch import (
 )
 
 __all__ = [
+    "ConformanceCase",
+    "ConformanceResult",
     "SdpaBackend",
     "__version__",
+    "assert_conforms",
     "available_backends",
+    "check_backend",
+    "conformance_cases",
     "get_backend",
     "register_backend",
     "scaled_dot_product_attention",

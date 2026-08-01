@@ -20,16 +20,29 @@ from portable_attention import scaled_dot_product_attention
 
 def test_public_exports_are_frozen():
     # The SDPA entry point and version SoT are the load-bearing surface; the
-    # backend-registry names are the M1 additive extension (the drop-in SDPA
-    # signature itself stays frozen to torch, verified below).
+    # backend-registry and conformance-kit names are the M1 additive extension
+    # (the drop-in SDPA signature itself stays frozen to torch, verified below).
     assert set(portable_attention.__all__) == {
+        "ConformanceCase",
+        "ConformanceResult",
         "SdpaBackend",
         "__version__",
+        "assert_conforms",
         "available_backends",
+        "check_backend",
+        "conformance_cases",
         "get_backend",
         "register_backend",
         "scaled_dot_product_attention",
     }
+
+
+def test_every_exported_name_is_bound():
+    # A name can be listed in ``__all__`` yet be missing from the module (a typo
+    # in the export list), which breaks ``from portable_attention import *`` and
+    # top-level attribute access. Verify each declared export actually resolves.
+    for name in portable_attention.__all__:
+        assert hasattr(portable_attention, name), f"{name!r} is exported but unbound"
 
 
 def test_version_is_nonempty_string():
