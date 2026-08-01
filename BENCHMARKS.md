@@ -36,6 +36,52 @@ Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 
 ---
 
+## 2026-08-01 — commit db41b9e — full-suite run from a clean checkout
+
+**Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1 (scipy-openblas
+0.3.33, `cortexa57` kernel). portable-attention 0.0.1. `threadpoolctl` 3.6.0.
+
+**BLAS threads (process default, via threadpoolctl):** openblas=4.
+
+Full gate from a fresh clone (`scripts/check.sh`): **187 passed**, **100%**
+coverage, ruff/format/pyright-strict/bandit/pip-audit all clean (~11 s).
+Install smoke: `uv build` → wheel installed into a throwaway venv → default and
+`is_causal=True` calls OK; `available_backends()` → `['fused', 'reference']`;
+`get_backend('fused'|'reference'|'auto')` all return correct-shape output.
+
+### Latency by shape (pinned to 1 BLAS thread, median over 20 repeats)
+
+| shape (B,H,S,D)   | dtype   | threads | latency (median) |
+|-------------------|---------|---------|-----------------:|
+| (1, 1, 64, 32)    | float32 | 1       |         0.172 ms |
+| (1, 8, 128, 64)   | float32 | 1       |         5.573 ms |
+| (2, 8, 256, 64)   | float32 | 1       |        45.297 ms |
+| (1, 12, 512, 64)  | float32 | 1       |       125.923 ms |
+
+### Reference vs fused at default OpenBLAS threads (median over 30 repeats)
+
+| shape (B,H,S,D)   | dtype   | reference | fused     | speedup |
+|-------------------|---------|----------:|----------:|--------:|
+| (1, 1, 64, 32)    | float32 |  0.168 ms |  0.115 ms |   1.46× |
+| (1, 8, 128, 64)   | float32 |  4.241 ms |  2.894 ms |   1.47× |
+| (2, 8, 256, 64)   | float32 | 33.895 ms | 22.373 ms |   1.52× |
+| (1, 12, 512, 64)  | float32 | 104.61 ms | 64.144 ms |   1.63× |
+| (4, 16, 256, 64)  | float32 | 139.63 ms | 89.416 ms |   1.56× |
+
+`fused` stays faster than the `reference` oracle at default threads on every
+shape. The *direction* is the reliable result and holds across runs; the
+speedup *magnitude* is run-dependent and should not be read as stable — it was
+1.9–4.9× in the 2026-07-26 block and 1.46–1.63× here. The difference is driven
+by the `reference` numbers, which came in well below 2026-07-26 (e.g.
+`(2,8,256,64)` 33.9 ms vs 122 ms; `(4,16,256,64)` 140 ms vs 365 ms) because the
+OpenBLAS small-GEMM cliff (issue #8) is load-dependent on a shared low-power
+board and was milder this run. This is not a regression: the `fused` latencies
+themselves are in line with (and mostly below) prior runs — e.g. `(2,8,256,64)`
+22.4 ms vs 24.9 ms, `(1,12,512,64)` 64.1 ms vs 79.4 ms — so absolute fused
+performance held or improved. No regressions filed.
+
+---
+
 ## 2026-07-26 — commit e55387f — fused backend removes the default-thread cliff
 
 **Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1 (scipy-openblas
