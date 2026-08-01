@@ -68,13 +68,17 @@ Install smoke: `uv build` → wheel installed into a throwaway venv → default 
 | (1, 12, 512, 64)  | float32 | 104.61 ms | 64.144 ms |   1.63× |
 | (4, 16, 256, 64)  | float32 | 139.63 ms | 89.416 ms |   1.56× |
 
-`fused` stays faster than the `reference` oracle at default threads across every
-shape (1.46–1.63×). The default-thread `reference` numbers came in noticeably
-below the 2026-07-26 block (e.g. `(2,8,256,64)` 33.9 ms vs 122 ms; `(4,16,256,64)`
-140 ms vs 365 ms) — the OpenBLAS small-GEMM cliff (issue #8) is load-dependent
-on a shared low-power board and was milder this run. This is not a regression:
-the cross-backend ratio, which is the stable signal, holds and `fused` still
-wins everywhere. No regressions filed.
+`fused` stays faster than the `reference` oracle at default threads on every
+shape. The *direction* is the reliable result and holds across runs; the
+speedup *magnitude* is run-dependent and should not be read as stable — it was
+1.9–4.9× in the 2026-07-26 block and 1.46–1.63× here. The difference is driven
+by the `reference` numbers, which came in well below 2026-07-26 (e.g.
+`(2,8,256,64)` 33.9 ms vs 122 ms; `(4,16,256,64)` 140 ms vs 365 ms) because the
+OpenBLAS small-GEMM cliff (issue #8) is load-dependent on a shared low-power
+board and was milder this run. This is not a regression: the `fused` latencies
+themselves are in line with (and mostly below) prior runs — e.g. `(2,8,256,64)`
+22.4 ms vs 24.9 ms, `(1,12,512,64)` 64.1 ms vs 79.4 ms — so absolute fused
+performance held or improved. No regressions filed.
 
 ---
 
