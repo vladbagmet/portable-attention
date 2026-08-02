@@ -92,6 +92,28 @@ A backend is any callable matching the `SdpaBackend` protocol (the same
 signature as `scaled_dot_product_attention`); register your own with
 `register_backend(name, backend)`.
 
+### Vulkan runtime detection
+
+The next backend on the roadmap (M2) is a portable GPU path built on **Vulkan
+(V3DV)**. It can only run where a Vulkan runtime is actually installed, so the
+package ships a dependency-free probe that reports what the host exposes:
+
+```python
+from portable_attention import detect_vulkan, vulkan_available
+
+if vulkan_available():
+    ...  # a Vulkan-backed backend could register here
+
+cap = detect_vulkan()
+print(cap.available, cap.loader, cap.binding, cap.reason)
+```
+
+`detect_vulkan()` checks for the Vulkan ICD loader (`libvulkan`) and a supported
+Python binding, returning a `VulkanCapability` describing the result (and a
+specific `reason` when unavailable). It performs no GPU work and adds no runtime
+dependency; on a CPU-only host it simply reports `available=False`. This is the
+gate a future V3DV backend uses to decide whether to register itself.
+
 ### Conformance kit
 
 The portability promise is *developer parity*: code written against

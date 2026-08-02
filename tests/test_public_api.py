@@ -20,20 +20,24 @@ from portable_attention import scaled_dot_product_attention
 
 def test_public_exports_are_frozen():
     # The SDPA entry point and version SoT are the load-bearing surface; the
-    # backend-registry and conformance-kit names are the M1 additive extension
+    # backend-registry and conformance-kit names are the M1 additive extension,
+    # and the Vulkan detection helpers are the M2 groundwork additive extension
     # (the drop-in SDPA signature itself stays frozen to torch, verified below).
     assert set(portable_attention.__all__) == {
         "ConformanceCase",
         "ConformanceResult",
         "SdpaBackend",
+        "VulkanCapability",
         "__version__",
         "assert_conforms",
         "available_backends",
         "check_backend",
         "conformance_cases",
+        "detect_vulkan",
         "get_backend",
         "register_backend",
         "scaled_dot_product_attention",
+        "vulkan_available",
     }
 
 
