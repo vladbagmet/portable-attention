@@ -117,14 +117,17 @@ def test_default_find_binding_survives_bad_module_spec(
     probe must treat that candidate as unavailable and keep going rather than
     propagate the error.
     """
-    name = vk._KNOWN_BINDINGS[0]
+    name = "kp"
+    # Pin the candidate list to this one name so a real second binding that
+    # happens to be installed can't make the assertion host-dependent.
+    monkeypatch.setattr(vk, "_KNOWN_BINDINGS", (name,))
     module = types.ModuleType(name)
     if spec_value == "__delete__":
         del module.__spec__
     else:
         module.__spec__ = None  # type: ignore[assignment]
     monkeypatch.setitem(sys.modules, name, module)
-    # First binding raises ValueError -> skipped; nothing else present -> None.
+    # The only candidate raises ValueError and is treated as unavailable.
     assert vk._default_find_binding() is None
 
 
