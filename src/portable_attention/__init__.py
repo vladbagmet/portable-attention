@@ -33,19 +33,23 @@ from .dispatch import (
     register_backend,
     scaled_dot_product_attention,
 )
+from .vulkan import VulkanCapability, detect_vulkan, vulkan_available
 
 __all__ = [
     "ConformanceCase",
     "ConformanceResult",
     "SdpaBackend",
+    "VulkanCapability",
     "__version__",
     "assert_conforms",
     "available_backends",
     "check_backend",
     "conformance_cases",
+    "detect_vulkan",
     "get_backend",
     "register_backend",
     "scaled_dot_product_attention",
+    "vulkan_available",
 ]
 
 # Single source of truth for the package version. The build backend
