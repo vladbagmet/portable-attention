@@ -57,8 +57,9 @@ signature compatibility but must be left at `0.0` (a non-zero value raises
 set of names re-exported from the top-level package (its `__all__`):
 `scaled_dot_product_attention`, `__version__`, the backend-registry helpers
 `get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
-protocol, and the conformance kit `assert_conforms`, `check_backend`,
-`conformance_cases`, `ConformanceCase`, and `ConformanceResult` (see
+protocol, the conformance kit `assert_conforms`, `check_backend`,
+`conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
+preflight `detect_vulkan`, `vulkan_available`, and `VulkanCapability` (see
 [Backends](#backends)); everything else is internal and may change.
 
 ## Backends
@@ -95,8 +96,8 @@ signature as `scaled_dot_product_attention`); register your own with
 ### Vulkan runtime detection
 
 The next backend on the roadmap (M2) is a portable GPU path built on **Vulkan
-(V3DV)**. It can only run where a Vulkan runtime is actually installed, so the
-package ships a dependency-free probe that reports what the host exposes:
+(V3DV)**. It can only run where the Vulkan dependencies are installed, so the
+package ships a dependency-free preflight that reports what the host exposes:
 
 ```python
 from portable_attention import detect_vulkan, vulkan_available
@@ -110,9 +111,11 @@ print(cap.available, cap.loader, cap.binding, cap.reason)
 
 `detect_vulkan()` checks for the Vulkan ICD loader (`libvulkan`) and a supported
 Python binding, returning a `VulkanCapability` describing the result (and a
-specific `reason` when unavailable). It performs no GPU work and adds no runtime
-dependency; on a CPU-only host it simply reports `available=False`. This is the
-gate a future V3DV backend uses to decide whether to register itself.
+specific `reason` when unavailable). It is a dependency *preflight*: `available`
+means a Vulkan backend is worth attempting, not that a GPU device is guaranteed
+— the backend still enumerates devices itself at registration. It performs no
+GPU work and adds no runtime dependency; on a CPU-only host it simply reports
+`available=False`.
 
 ### Conformance kit
 

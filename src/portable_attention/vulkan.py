@@ -1,24 +1,25 @@
 """Vulkan runtime capability detection.
 
 The M2 goal is a portable GPU backend built on **Vulkan (V3DV)** — see
-``ROADMAP.md``. Before any such backend can register itself, the package has to
-answer one honest question on the host it is imported on: *is a usable Vulkan
-runtime present at all?* This module answers exactly that, and nothing more. It
-performs no GPU work and pulls in no new dependency; it only inspects what the
-system already exposes.
+``ROADMAP.md``. This module answers a narrow, honest question on the host it is imported
+on: *are the dependencies a Vulkan backend needs present at all?* It is a
+**dependency preflight**, not a promise that a GPU will enumerate — confirming
+an actual, working device is real Vulkan work that only a backend can do at
+registration. This module performs no GPU work and pulls in no new dependency;
+it only inspects what the system already exposes.
 
-Detection has two independent parts:
+The preflight has two independent parts:
 
 * the **Vulkan ICD loader** (the ``libvulkan`` shared library), located with
   :func:`ctypes.util.find_library`; without it there is no Vulkan on the host;
 * a supported **Python binding** to drive Vulkan compute, detected by import
   probing (no import side effects).
 
-Both must be present for :func:`detect_vulkan` to report the runtime available.
-The probes are injectable so the logic is fully unit-testable on a host with no
-Vulkan at all (such as the CPU-only development floor), where detection
-correctly reports *unavailable* with a specific reason. A future V3DV backend
-gates its own registration on :func:`vulkan_available`.
+Both must be present for :func:`detect_vulkan` to report ``available`` — i.e.
+*worth attempting*. A backend still enumerates devices itself before it commits
+to registering. The probes are injectable so the logic is fully unit-testable
+on a host with no Vulkan at all (such as the CPU-only development floor), where
+the preflight correctly reports *unavailable* with a specific reason.
 """
 
 from __future__ import annotations
@@ -45,11 +46,14 @@ _NO_LOADER_REASON = (
 
 @dataclass(frozen=True)
 class VulkanCapability:
-    """Result of probing the host for a usable Vulkan runtime.
+    """Result of the Vulkan dependency preflight for a host.
 
     Attributes:
-        available: ``True`` only when both a Vulkan ICD loader and a supported
-            Python binding are present. When ``False``, ``reason`` explains why.
+        available: ``True`` when the dependencies a Vulkan backend needs — both
+            a Vulkan ICD loader and a supported Python binding — are present, so
+            attempting the backend is worthwhile. It does **not** guarantee a
+            usable GPU device; the backend confirms that itself. When
+            ``False``, ``reason`` explains why.
         loader: The ICD loader library name reported by the system (e.g.
             ``"libvulkan.so.1"``), or ``None`` when no loader was found.
         binding: The name of the first supported, importable Python binding, or
@@ -76,7 +80,14 @@ def _default_find_binding() -> str | None:
     importing it, so probing has no side effects.
     """
     for name in _KNOWN_BINDINGS:
-        if importlib.util.find_spec(name) is not None:
+        try:
+            spec = importlib.util.find_spec(name)
+        except ValueError:
+            # A stale/partly-initialised entry in ``sys.modules`` (missing or
+            # ``None`` ``__spec__``) makes ``find_spec`` raise; treat that
+            # candidate as unavailable and keep probing the rest.
+            continue
+        if spec is not None:
             return name
     return None
 
@@ -86,12 +97,15 @@ def detect_vulkan(
     find_loader: Callable[[], str | None] = _default_find_loader,
     find_binding: Callable[[], str | None] = _default_find_binding,
 ) -> VulkanCapability:
-    """Probe the host and describe its Vulkan runtime capability.
+    """Preflight the host for the dependencies a Vulkan backend needs.
 
-    The two probes are injectable so the detection logic can be exercised
-    without a Vulkan runtime installed (and so a real backend can supply
-    stricter device-level probes later). Defaults inspect the system Vulkan
-    loader and the installed Python bindings.
+    Reports whether the Vulkan ICD loader and a supported Python binding are
+    present. This is a *necessary* precondition, not a guarantee that a GPU
+    device will enumerate — a backend performs its own device probe at
+    registration. The two probes are injectable so the logic can be exercised
+    without a Vulkan runtime installed (and so a backend can supply stricter
+    probes later). Defaults inspect the system Vulkan loader and the installed
+    Python bindings.
 
     Args:
         find_loader: Callable returning the ICD loader library name, or ``None``
@@ -126,9 +140,11 @@ def detect_vulkan(
 
 
 def vulkan_available() -> bool:
-    """Return ``True`` when the host has a usable Vulkan runtime.
+    """Return ``True`` when the Vulkan backend dependencies are present.
 
-    Convenience wrapper over :func:`detect_vulkan` for the common yes/no gate
-    (e.g. deciding whether to register a Vulkan-backed attention backend).
+    Convenience wrapper over :func:`detect_vulkan` for the common yes/no
+    preflight (e.g. deciding whether it is worth a Vulkan-backed backend
+    attempting device enumeration). ``True`` means the loader and a supported
+    binding are installed, not that a GPU device is guaranteed usable.
     """
     return detect_vulkan().available

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 
 import pytest
 
@@ -105,10 +107,38 @@ def test_default_find_binding_hits_and_misses(
     assert vk._default_find_binding() is None
 
 
-def test_default_find_loader_returns_str_or_none() -> None:
-    """The default loader probe returns whatever the host reports, unmodified."""
-    result = vk._default_find_loader()
-    assert result is None or isinstance(result, str)
+@pytest.mark.parametrize("spec_value", [None, "__delete__"])
+def test_default_find_binding_survives_bad_module_spec(
+    monkeypatch: pytest.MonkeyPatch, spec_value: object
+) -> None:
+    """A stale ``sys.modules`` entry (missing/None ``__spec__``) is skipped.
+
+    ``importlib.util.find_spec`` raises ``ValueError`` for such an entry; the
+    probe must treat that candidate as unavailable and keep going rather than
+    propagate the error.
+    """
+    name = vk._KNOWN_BINDINGS[0]
+    module = types.ModuleType(name)
+    if spec_value == "__delete__":
+        del module.__spec__
+    else:
+        module.__spec__ = None  # type: ignore[assignment]
+    monkeypatch.setitem(sys.modules, name, module)
+    # First binding raises ValueError -> skipped; nothing else present -> None.
+    assert vk._default_find_binding() is None
+
+
+def test_default_find_loader_probes_vulkan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default loader probe queries ``find_library("vulkan")`` verbatim."""
+    calls: list[str] = []
+
+    def fake_find_library(name: str) -> str:
+        calls.append(name)
+        return "libvulkan.so.sentinel"
+
+    monkeypatch.setattr(vk.ctypes.util, "find_library", fake_find_library)
+    assert vk._default_find_loader() == "libvulkan.so.sentinel"
+    assert calls == ["vulkan"]
 
 
 def test_detect_defaults_run_on_host() -> None:
