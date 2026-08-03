@@ -63,6 +63,7 @@ no more than 256 invocations per workgroup:
 | `maxPerStageDescriptorStorageBuffers` | 8 |
 | `maxStorageBufferRange` | 1 GiB |
 | `maxMemoryAllocationSize` | 1 GiB |
+
 - *Deferred (hardware-gated):* a Metal forward+backward backend for the verified
   Apple training gap is a separate future track, not part of this roadmap — it
   requires Apple hardware the current development environment does not have.

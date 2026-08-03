@@ -279,6 +279,35 @@ def test_probe_devices_handles_enumeration_failures(
     assert lib.destroyed == 1
 
 
+def test_probe_devices_handles_partial_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loader missing a symbol mid-enumeration still reports no devices."""
+
+    class _PartialLib(_FakeLib):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "vkGetPhysicalDeviceProperties":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    lib = _install_lib(monkeypatch, _PartialLib((("V3D", 1 << 22, (0x2,)),)))
+    assert vk._default_probe_devices("libvulkan.so.1") == ()
+    assert lib.destroyed == 1
+
+
+def test_probe_devices_survives_failing_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Devices found are still returned when the instance cannot be destroyed."""
+
+    class _UndestroyableLib(_FakeLib):
+        def vkDestroyInstance(self, instance: Any, allocator: Any) -> None:  # noqa: N802
+            raise AttributeError("vkDestroyInstance")
+
+    _install_lib(monkeypatch, _UndestroyableLib((("V3D", 1 << 22, (0x2,)),)))
+    assert vk._default_probe_devices("libvulkan.so.1") == (
+        vk.VulkanDevice(name="V3D", api_version="1.0.0", compute=True),
+    )
+
+
 def test_probe_devices_handles_zero_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """A loader with no ICD enumerates successfully but reports nothing."""
     lib = _install_lib(monkeypatch, _FakeLib(()))

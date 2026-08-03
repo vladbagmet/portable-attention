@@ -29,6 +29,7 @@ a host with no Vulkan at all (or with a device that has no compute queue).
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 from collections.abc import Callable
@@ -207,13 +208,20 @@ def _enumerate_devices(
     ]
 
 
+def _destroy_instance(lib: ctypes.CDLL, instance: ctypes.c_void_p) -> None:
+    """Release the throwaway instance, tolerating a loader that cannot."""
+    with contextlib.suppress(AttributeError, OSError):
+        lib.vkDestroyInstance(instance, None)
+
+
 def _default_probe_devices(loader: str) -> tuple[VulkanDevice, ...]:
     """Enumerate Vulkan devices through ``loader``; empty on any failure.
 
     Creates a temporary instance with no layers or extensions, describes each
-    physical device it can see, and destroys the instance again. Any failure to
-    load the library or create the instance is reported as "no devices" rather
-    than raised: detection must never take down an import on a broken install.
+    physical device it can see, and destroys the instance again. Every failure
+    mode — an unloadable library, a missing entry point, a driver that refuses
+    to create an instance — is reported as "no devices" rather than raised:
+    detection must never take down an import on a broken install.
     """
     try:
         lib = ctypes.CDLL(loader)
@@ -225,14 +233,14 @@ def _default_probe_devices(loader: str) -> tuple[VulkanDevice, ...]:
         status = lib.vkCreateInstance(
             ctypes.pointer(create_info), None, ctypes.pointer(instance)
         )
+        if status != _VK_SUCCESS or not instance:
+            return ()
+        try:
+            return tuple(_enumerate_devices(lib, instance))
+        finally:
+            _destroy_instance(lib, instance)
     except (AttributeError, OSError):
         return ()
-    if status != _VK_SUCCESS or not instance:
-        return ()
-    try:
-        return tuple(_enumerate_devices(lib, instance))
-    finally:
-        lib.vkDestroyInstance(instance, None)
 
 
 def detect_vulkan(

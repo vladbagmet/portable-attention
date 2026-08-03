@@ -116,7 +116,9 @@ for device in cap.devices:
 throwaway instance through it, and enumerates the physical devices, recording
 each device's name, Vulkan API version, and whether any of its queue families
 advertises `VK_QUEUE_COMPUTE_BIT`. `available` is `True` when at least one
-device can run compute; otherwise `reason` says which step came up empty.
+device can run compute; otherwise `reason` says which step came up empty. For a
+quick summary without walking `cap.devices`, use `cap.device_count` and
+`cap.device_names`.
 On a board with V3DV that looks like:
 
 ```text
