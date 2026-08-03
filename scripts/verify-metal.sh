@@ -92,11 +92,13 @@ if pipeline is None:
 line("- runtime shader compile: ok (newLibraryWithSource, no Xcode needed)")
 line()
 
-max_threads = device.maxThreadsPerThreadgroup()
 line("| Limit | value |")
 line("| --- | --- |")
 line(f"| shared / threadgroup memory | {device.maxThreadgroupMemoryLength()} B |")
-line(f"| max invocations per workgroup | {max_threads.width} |")
+line(
+    "| max invocations per workgroup | "
+    f"{pipeline.maxTotalThreadsPerThreadgroup()} |"
+)
 line(f"| SIMD / subgroup width | {pipeline.threadExecutionWidth()} |")
 line(f"| max buffer / storage range | {device.maxBufferLength()} B |")
 line(f"| unified memory | {'yes' if device.hasUnifiedMemory() else 'no'} |")
