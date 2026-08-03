@@ -34,6 +34,23 @@ It runs, in order: `ruff check` (lint), `ruff format --check` (formatting),
 vulnerabilities), and `coverage run -m pytest` + `coverage report` (tests with
 a coverage floor). Every step must pass; do not weaken a check to get green.
 
+## Verifying the Metal backend
+
+No CI runner the project controls has an Apple GPU, so Metal changes cannot be
+verified by the same machinery as everything else. A Metal pull request is
+signed off by a human running, on a Mac:
+
+```sh
+uv pip install -e ".[dev,metal]"
+./scripts/verify-metal.sh
+```
+
+The script prints the device name, its threadgroup/SIMD limits, whether the MSL
+kernel compiled through the Metal runtime compiler, conformance results against
+the reference oracle, and benchmark numbers. Paste that report into the PR
+as-is. Until it appears, describe the change as compiled but not run on
+hardware; never claim a result that no report backs.
+
 ## Reviews
 
 Every non-draft PR gets an automatic advisory review from CodeRabbit plus a

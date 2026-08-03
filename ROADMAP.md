@@ -64,9 +64,47 @@ no more than 256 invocations per workgroup:
 | `maxStorageBufferRange` | 1 GiB |
 | `maxMemoryAllocationSize` | 1 GiB |
 
-- *Deferred (hardware-gated):* a Metal forward+backward backend for the verified
-  Apple training gap is a separate future track, not part of this roadmap — it
-  requires Apple hardware the current development environment does not have.
+Those numbers belong to the device, not to the kernel. The tiling policy is
+written once, parameterized by `(shared_memory_bytes, max_threads_per_group,
+simd_width)`, and each backend supplies its own values — M2 pays for that seam
+so M3 gets a tile size instead of a second hand-tuned kernel.
+
+## M3 — Metal backend (Apple Silicon)
+
+**Goal:** the same conformance kit passing on an Apple GPU, reached from a plain
+`pip install` with no developer tooling on the machine.
+
+- Forward SDPA compute kernel in MSL, embedded as source and compiled at first
+  use through the Metal runtime compiler (`newLibraryWithSource:`), with the
+  pipeline state cached. No precompiled `.metallib`, no Xcode requirement.
+- Python reaches Metal through `pyobjc-framework-Metal`, declared as the
+  `metal` optional extra and imported lazily; core install stays NumPy-only.
+- Registration is gated on a real device, so `available_backends()` is unchanged
+  on non-Apple hosts and the existing suite keeps running everywhere.
+- Conformance-kit pass against the reference oracle, then dated benchmarks in
+  `BENCHMARKS.md`. Backward/autograd is a later brick.
+- A `macos-14` (arm64) CI job that runtime-compiles the MSL and runs the
+  conformance kit when `MTLCreateSystemDefaultDevice()` returns a device.
+  Whether hosted macOS runners expose a usable GPU is unknown, so the job is
+  probed before anything depends on it; offline `xcrun metal` stays a
+  non-blocking extra at most.
+
+The measured limits on the reference Apple device sit roughly 2x above V3D on
+every axis that shapes a tile, which is what the parameterized policy above is
+for:
+
+| Limit | V3D 7.1.7.0 | Apple M1 Pro (14-core, `apple7`/`metal3`) |
+| --- | --- | --- |
+| shared / threadgroup memory | 16 KiB | 32 KiB |
+| max invocations per workgroup | 256 | 1024 |
+| SIMD / subgroup width | 16 | 32 |
+| max buffer / storage range | 1 GiB | 16 GiB |
+| unified memory | yes | yes |
+
+Apple hardware is not reachable from the machines that run CI, so a Metal brick
+is signed off by a human running `scripts/verify-metal.sh` on a Mac and pasting
+its report into the PR. Until such a report exists, a Metal change is described
+as compiled-but-unverified — see CONTRIBUTING.md.
 
 ## Continuous (not milestone-gated)
 

@@ -25,6 +25,9 @@ Homepage = "https://github.com/vladbagmet/portable-attention"
 Repository = "https://github.com/vladbagmet/portable-attention"
 
 [project.optional-dependencies]
+# Metal is an Objective-C API, so the GPU path on macOS needs a bridge; it is
+# never a core dependency and the backend imports it lazily.
+metal = ["pyobjc-framework-Metal>=10; sys_platform == 'darwin'"]
 dev = [
     "pytest>=7",
     "ruff>=0.5",
