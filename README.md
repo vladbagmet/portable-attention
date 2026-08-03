@@ -59,7 +59,8 @@ set of names re-exported from the top-level package (its `__all__`):
 `get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
 protocol, the conformance kit `assert_conforms`, `check_backend`,
 `conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
-preflight `detect_vulkan`, `vulkan_available`, and `VulkanCapability` (see
+detection helpers `detect_vulkan`, `vulkan_available`, `VulkanCapability`, and
+`VulkanDevice` (see
 [Backends](#backends)); everything else is internal and may change.
 
 ## Backends
@@ -93,11 +94,11 @@ A backend is any callable matching the `SdpaBackend` protocol (the same
 signature as `scaled_dot_product_attention`); register your own with
 `register_backend(name, backend)`.
 
-### Vulkan runtime detection
+### Vulkan device detection
 
 The next backend on the roadmap (M2) is a portable GPU path built on **Vulkan
-(V3DV)**. It can only run where the Vulkan dependencies are installed, so the
-package ships a dependency-free preflight that reports what the host exposes:
+(V3DV)**, so the package ships a detector that reports what Vulkan hardware the
+host actually exposes:
 
 ```python
 from portable_attention import detect_vulkan, vulkan_available
@@ -106,16 +107,27 @@ if vulkan_available():
     ...  # a Vulkan-backed backend could register here
 
 cap = detect_vulkan()
-print(cap.available, cap.loader, cap.binding, cap.reason)
+print(cap.available, cap.loader, cap.reason)
+for device in cap.devices:
+    print(device.name, device.api_version, device.compute)
 ```
 
-`detect_vulkan()` checks for the Vulkan ICD loader (`libvulkan`) and a supported
-Python binding, returning a `VulkanCapability` describing the result (and a
-specific `reason` when unavailable). It is a dependency *preflight*: `available`
-means a Vulkan backend is worth attempting, not that a GPU device is guaranteed
-— the backend still enumerates devices itself at registration. It performs no
-GPU work and adds no runtime dependency; on a CPU-only host it simply reports
-`available=False`.
+`detect_vulkan()` locates the Vulkan ICD loader (`libvulkan`), creates a
+throwaway instance through it, and enumerates the physical devices, recording
+each device's name, Vulkan API version, and whether any of its queue families
+advertises `VK_QUEUE_COMPUTE_BIT`. `available` is `True` when at least one
+device can run compute; otherwise `reason` says which step came up empty.
+On a board with V3DV that looks like:
+
+```text
+True libvulkan.so.1 None
+V3D 7.1.7.0 1.2.289 True
+llvmpipe (LLVM 15.0.6, 128 bits) 1.3.289 True
+```
+
+The loader is called with `ctypes`, so detection adds no runtime dependency —
+no Python Vulkan binding is needed or used. It opens no device and submits no
+GPU work; a host without Vulkan reports `available=False` rather than failing.
 
 ### Conformance kit
 

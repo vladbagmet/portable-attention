@@ -40,8 +40,29 @@ reproducible benchmark harness.
 
 - Path: **Vulkan (V3DV)** as the portable GPU backend, validated on low-power
   ARM hardware. CPU reference remains the correctness oracle.
+- **Device detection** — enumerate physical devices through the loader and
+  report which can run compute. *(done: `detect_vulkan`)*
+- **Backend registration** gated on a compute-capable device, driving a minimal
+  SPIR-V attention kernel, validated against the reference oracle through the
+  conformance kit.
+- **llvmpipe as the CI Vulkan target** — software Vulkan 1.3 needs no GPU, so
+  hosted runners can execute the conformance kit on the Vulkan backend.
+- Dated Vulkan numbers appended to `BENCHMARKS.md` alongside the CPU backends.
 - Optional autograd hook (backward pass) so the layer becomes training-usable on
   the Vulkan path.
+
+Kernel design has to fit the V3D (VideoCore VII) device limits measured on the
+reference board — a flash-style tile must live within 16 KiB of shared memory at
+no more than 256 invocations per workgroup:
+
+| Limit | V3D 7.1.7.0 |
+| --- | --- |
+| `maxComputeSharedMemorySize` | 16384 (16 KiB) |
+| `maxComputeWorkGroupInvocations` | 256 |
+| `subgroupSize` (with `subgroupSizeControl`) | 16 |
+| `maxPerStageDescriptorStorageBuffers` | 8 |
+| `maxStorageBufferRange` | 1 GiB |
+| `maxMemoryAllocationSize` | 1 GiB |
 - *Deferred (hardware-gated):* a Metal forward+backward backend for the verified
   Apple training gap is a separate future track, not part of this roadmap — it
   requires Apple hardware the current development environment does not have.
