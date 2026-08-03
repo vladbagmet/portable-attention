@@ -28,6 +28,7 @@ def test_public_exports_are_frozen():
         "ConformanceResult",
         "SdpaBackend",
         "VulkanCapability",
+        "VulkanDevice",
         "__version__",
         "assert_conforms",
         "available_backends",

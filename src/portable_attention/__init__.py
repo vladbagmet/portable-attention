@@ -33,13 +33,14 @@ from .dispatch import (
     register_backend,
     scaled_dot_product_attention,
 )
-from .vulkan import VulkanCapability, detect_vulkan, vulkan_available
+from .vulkan import VulkanCapability, VulkanDevice, detect_vulkan, vulkan_available
 
 __all__ = [
     "ConformanceCase",
     "ConformanceResult",
     "SdpaBackend",
     "VulkanCapability",
+    "VulkanDevice",
     "__version__",
     "assert_conforms",
     "available_backends",
