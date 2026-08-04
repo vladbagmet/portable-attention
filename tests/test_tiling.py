@@ -122,10 +122,12 @@ def test_policy_ignores_device_identity():
 
 
 def test_sequence_lengths_cap_the_blocks():
-    # A 24-row key sequence rounds up to 32; blocks never exceed that.
+    # Caps round UP to the next power of two, so one tile can still cover the
+    # whole sequence: 3 query rows permit block_q=4, 24 key rows permit 32.
     plan = plan_tiles(64, 4, M1_PRO_LIMITS, seq_len_q=3, seq_len_k=24)
     assert plan.block_q <= 4
     assert plan.block_k <= 32
+    assert plan.q_tiles(3) == 1
 
 
 def test_sequence_lengths_only_shrink_the_plan():
@@ -146,12 +148,12 @@ def test_tile_counts_cover_the_sequence():
     assert plan.k_tiles(plan.block_k * 3) == 3
 
 
-@pytest.mark.parametrize("seq_len", [0, -4])
-def test_tile_counts_reject_nonpositive_lengths(seq_len):
+@pytest.mark.parametrize("seq_len", [0, -4, 12.0, True])
+def test_tile_counts_reject_non_positive_integer_lengths(seq_len):
     plan = plan_tiles(64, 4, V3D_LIMITS)
-    with pytest.raises(ValueError, match="seq_len_q must be positive"):
+    with pytest.raises(ValueError, match="seq_len_q must be a positive integer"):
         plan.q_tiles(seq_len)
-    with pytest.raises(ValueError, match="seq_len_k must be positive"):
+    with pytest.raises(ValueError, match="seq_len_k must be a positive integer"):
         plan.k_tiles(seq_len)
 
 
@@ -201,9 +203,14 @@ def test_impossible_device_without_a_name_still_explains():
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"shared_memory_bytes": 0}, "shared_memory_bytes must be positive"),
-        ({"max_threads_per_group": -1}, "max_threads_per_group must be positive"),
-        ({"simd_width": 0}, "simd_width must be positive"),
+        ({"shared_memory_bytes": 0}, "shared_memory_bytes must be a positive integer"),
+        ({"max_threads_per_group": -1}, "max_threads_per_group must be a positive"),
+        ({"simd_width": 0}, "simd_width must be a positive integer"),
+        # A float byte count would price a fractional layout, and bool is an
+        # int subclass that would sail through a naive isinstance check.
+        ({"shared_memory_bytes": 16384.0}, "shared_memory_bytes must be a positive"),
+        ({"simd_width": 16.0}, "simd_width must be a positive integer"),
+        ({"max_threads_per_group": True}, "max_threads_per_group must be a positive"),
         ({"simd_width": 24}, "simd_width must be a power of two"),
         ({"max_threads_per_group": 8}, "max_threads_per_group must be at least"),
     ],
@@ -221,10 +228,13 @@ def test_device_limits_validation(kwargs, message):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"head_dim": 0}, "head_dim must be positive"),
-        ({"dtype_bytes": -2}, "dtype_bytes must be positive"),
-        ({"seq_len_q": 0}, "seq_len_q must be positive"),
-        ({"seq_len_k": -8}, "seq_len_k must be positive"),
+        ({"head_dim": 0}, "head_dim must be a positive integer"),
+        ({"dtype_bytes": -2}, "dtype_bytes must be a positive integer"),
+        ({"seq_len_q": 0}, "seq_len_q must be a positive integer"),
+        ({"seq_len_k": -8}, "seq_len_k must be a positive integer"),
+        ({"head_dim": 64.0}, "head_dim must be a positive integer"),
+        ({"dtype_bytes": 4.5}, "dtype_bytes must be a positive integer"),
+        ({"seq_len_k": True}, "seq_len_k must be a positive integer"),
     ],
 )
 def test_plan_tiles_validation(kwargs, message):
@@ -236,10 +246,12 @@ def test_plan_tiles_validation(kwargs, message):
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"block_q": 0}, "block_q must be positive"),
-        ({"block_k": -1}, "block_k must be positive"),
-        ({"head_dim": 0}, "head_dim must be positive"),
-        ({"dtype_bytes": 0}, "dtype_bytes must be positive"),
+        ({"block_q": 0}, "block_q must be a positive integer"),
+        ({"block_k": -1}, "block_k must be a positive integer"),
+        ({"head_dim": 0}, "head_dim must be a positive integer"),
+        ({"dtype_bytes": 0}, "dtype_bytes must be a positive integer"),
+        ({"block_q": 8.0}, "block_q must be a positive integer"),
+        ({"dtype_bytes": False}, "dtype_bytes must be a positive integer"),
     ],
 )
 def test_shared_memory_bytes_validation(kwargs, message):

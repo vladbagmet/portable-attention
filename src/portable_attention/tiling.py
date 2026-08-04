@@ -27,9 +27,10 @@ powers of two, which keeps the reduction tree and the subgroup split exact.
 
 Among the tiles that fit, the policy prefers the largest workgroup (occupancy),
 then the widest key tile (fewer passes over K/V), then the widest query tile.
-Sequence lengths, when known, cap the blocks so a short input does not reserve
-shared memory it can never fill; a partial trailing tile is the kernel's job to
-mask.
+Sequence lengths, when known, cap the blocks: each cap is the next power of two
+at or above the length, so one tile can still cover the whole sequence
+(``seq_len_q=3`` permits ``block_q=4``) while a 24-row key sequence never draws
+a 512-row block. A partial trailing tile is the kernel's job to mask.
 """
 
 from __future__ import annotations
@@ -49,6 +50,18 @@ __all__ = [
 
 class TileSizingError(ValueError):
     """Raised when no tile shape satisfies a device's limits."""
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    """Return ``value`` as an ``int``, rejecting anything that is not one.
+
+    Every quantity here counts bytes, rows, or invocations, so a float would
+    silently produce fractional shared-memory budgets and a ``bool`` would slip
+    through ``isinstance(..., int)``. Both are rejected before any arithmetic.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -80,8 +93,7 @@ class DeviceLimits:
             ("max_threads_per_group", self.max_threads_per_group),
             ("simd_width", self.simd_width),
         ):
-            if value <= 0:
-                raise ValueError(f"{field} must be positive, got {value}")
+            _require_positive_int(field, value)
         if self.simd_width & (self.simd_width - 1):
             raise ValueError(
                 f"simd_width must be a power of two, got {self.simd_width}"
@@ -155,8 +167,7 @@ class TilePlan:
 
 
 def _tiles(seq_len: int, block: int, label: str) -> int:
-    if seq_len <= 0:
-        raise ValueError(f"{label} must be positive, got {seq_len}")
+    _require_positive_int(label, seq_len)
     return -(-seq_len // block)
 
 
@@ -182,7 +193,7 @@ def shared_memory_bytes_for(
         The total byte count.
 
     Raises:
-        ValueError: If any argument is not positive.
+        ValueError: If any argument is not a positive integer.
     """
     for field, value in (
         ("block_q", block_q),
@@ -190,8 +201,7 @@ def shared_memory_bytes_for(
         ("head_dim", head_dim),
         ("dtype_bytes", dtype_bytes),
     ):
-        if value <= 0:
-            raise ValueError(f"{field} must be positive, got {value}")
+        _require_positive_int(field, value)
     elements = (
         block_q * head_dim  # Q tile
         + 2 * block_k * head_dim  # K and V tiles
@@ -232,25 +242,26 @@ def plan_tiles(
         dtype_bytes: Size of one element of the kernel's compute dtype, e.g.
             4 for float32.
         limits: The target device's limits.
-        seq_len_q: Query sequence length, when known. Caps ``block_q`` so a
-            short sequence does not reserve unusable shared memory.
-        seq_len_k: Key/value sequence length, when known. Caps ``block_k``.
+        seq_len_q: Query sequence length, when known. Caps ``block_q`` at the
+            next power of two at or above it, so a short sequence does not
+            reserve shared memory for rows that cannot exist.
+        seq_len_k: Key/value sequence length, when known. Caps ``block_k`` the
+            same way.
 
     Returns:
         The largest tile shape that fits, by the preference order documented in
         the module docstring.
 
     Raises:
-        ValueError: If any argument is not positive.
+        ValueError: If any argument is not a positive integer.
         TileSizingError: If not even a single query row against a single key
             row fits in the device's shared memory.
     """
     for field, value in (("head_dim", head_dim), ("dtype_bytes", dtype_bytes)):
-        if value <= 0:
-            raise ValueError(f"{field} must be positive, got {value}")
+        _require_positive_int(field, value)
     for field, optional in (("seq_len_q", seq_len_q), ("seq_len_k", seq_len_k)):
-        if optional is not None and optional <= 0:
-            raise ValueError(f"{field} must be positive, got {optional}")
+        if optional is not None:
+            _require_positive_int(field, optional)
 
     max_threads = limits.max_threads_per_group
     q_cap = (

@@ -151,9 +151,10 @@ print(plan.shared_memory_bytes, plan.k_tiles(4096))  # 13440 256
 shared/threadgroup memory per workgroup, maximum invocations per workgroup, and
 SIMD/subgroup width. `plan_tiles` returns the largest tile that fits, preferring
 a full workgroup, then a wide key tile. Pass `seq_len_q` / `seq_len_k` when they
-are known and short sequences stop reserving memory they cannot fill. The layout
-being priced is documented on `shared_memory_bytes_for`, which kernels use so
-both sides agree on the budget.
+are known and the blocks are capped at the next power of two at or above the
+length, so a short input stops drawing a tile it can never fill. The layout being
+priced is documented on `shared_memory_bytes_for`; a kernel calls it too, so both
+sides bill the same budget. No backend consumes the policy yet.
 
 ### Conformance kit
 
