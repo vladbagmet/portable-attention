@@ -144,7 +144,7 @@ from portable_attention.tiling import V3D_LIMITS
 
 plan = plan_tiles(head_dim=64, dtype_bytes=4, limits=V3D_LIMITS)
 print(plan.block_q, plan.block_k, plan.threads_per_group)  # 16 16 256
-print(plan.shared_memory_bytes, plan.k_tiles(4096))        # 13440 256
+print(plan.shared_memory_bytes, plan.k_tiles(4096))  # 13440 256
 ```
 
 `DeviceLimits` carries the three numbers a backend queries from its API:
