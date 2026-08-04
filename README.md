@@ -131,6 +131,31 @@ The loader is called with `ctypes`, so detection adds no runtime dependency —
 no Python Vulkan binding is needed or used. It opens no device and submits no
 GPU work; a host without Vulkan reports `available=False` rather than failing.
 
+### Tile sizing
+
+A blocked (flash-style) attention kernel streams the key/value sequence in
+tiles so the full score matrix never has to exist. How large a tile may be is a
+property of the device, not of the algorithm, so the policy lives in one place
+and takes the device numbers as data:
+
+```python
+from portable_attention import plan_tiles
+from portable_attention.tiling import V3D_LIMITS
+
+plan = plan_tiles(head_dim=64, dtype_bytes=4, limits=V3D_LIMITS)
+print(plan.block_q, plan.block_k, plan.threads_per_group)  # 16 16 256
+print(plan.shared_memory_bytes, plan.k_tiles(4096))  # 13440 256
+```
+
+`DeviceLimits` carries the three numbers a backend queries from its API:
+shared/threadgroup memory per workgroup, maximum invocations per workgroup, and
+SIMD/subgroup width. `plan_tiles` returns the largest tile that fits, preferring
+a full workgroup, then a wide key tile. Pass `seq_len_q` / `seq_len_k` when they
+are known and the blocks are capped at the next power of two at or above the
+length, so a short input stops drawing a tile it can never fill. The layout being
+priced is documented on `shared_memory_bytes_for`; a kernel calls it too, so both
+sides bill the same budget. No backend consumes the policy yet.
+
 ### Conformance kit
 
 The portability promise is *developer parity*: code written against

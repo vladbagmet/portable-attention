@@ -15,6 +15,10 @@ backend must pass the shared conformance kit (:func:`assert_conforms`,
 :func:`check_backend`, :func:`conformance_cases`), which pins the
 developer-parity promise: identical behaviour against the reference oracle
 across the documented contract matrix.
+
+Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
+:class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
+shared-memory / workgroup / SIMD numbers instead of a second hand-tuned kernel.
 """
 
 from __future__ import annotations
@@ -33,12 +37,22 @@ from .dispatch import (
     register_backend,
     scaled_dot_product_attention,
 )
+from .tiling import (
+    DeviceLimits,
+    TilePlan,
+    TileSizingError,
+    plan_tiles,
+    shared_memory_bytes_for,
+)
 from .vulkan import VulkanCapability, VulkanDevice, detect_vulkan, vulkan_available
 
 __all__ = [
     "ConformanceCase",
     "ConformanceResult",
+    "DeviceLimits",
     "SdpaBackend",
+    "TilePlan",
+    "TileSizingError",
     "VulkanCapability",
     "VulkanDevice",
     "__version__",
@@ -48,8 +62,10 @@ __all__ = [
     "conformance_cases",
     "detect_vulkan",
     "get_backend",
+    "plan_tiles",
     "register_backend",
     "scaled_dot_product_attention",
+    "shared_memory_bytes_for",
     "vulkan_available",
 ]
 

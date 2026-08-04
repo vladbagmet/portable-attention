@@ -21,12 +21,16 @@ from portable_attention import scaled_dot_product_attention
 def test_public_exports_are_frozen():
     # The SDPA entry point and version SoT are the load-bearing surface; the
     # backend-registry and conformance-kit names are the M1 additive extension,
-    # and the Vulkan detection helpers are the M2 groundwork additive extension
-    # (the drop-in SDPA signature itself stays frozen to torch, verified below).
+    # and the Vulkan detection plus tile-sizing helpers are the M2 groundwork
+    # additive extension (the drop-in SDPA signature itself stays frozen to
+    # torch, verified below).
     assert set(portable_attention.__all__) == {
         "ConformanceCase",
         "ConformanceResult",
+        "DeviceLimits",
         "SdpaBackend",
+        "TilePlan",
+        "TileSizingError",
         "VulkanCapability",
         "VulkanDevice",
         "__version__",
@@ -36,8 +40,10 @@ def test_public_exports_are_frozen():
         "conformance_cases",
         "detect_vulkan",
         "get_backend",
+        "plan_tiles",
         "register_backend",
         "scaled_dot_product_attention",
+        "shared_memory_bytes_for",
         "vulkan_available",
     }
 

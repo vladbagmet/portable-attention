@@ -42,6 +42,8 @@ reproducible benchmark harness.
   ARM hardware. CPU reference remains the correctness oracle.
 - **Device detection** — enumerate physical devices through the loader and
   report which can run compute. *(done: `detect_vulkan`)*
+- **Tile sizing policy** — one device-parameterized planner shared by every
+  blocked backend. *(done: `plan_tiles`)*
 - **Backend registration** gated on a compute-capable device, driving a minimal
   SPIR-V attention kernel, validated against the reference oracle through the
   conformance kit.
@@ -67,7 +69,10 @@ no more than 256 invocations per workgroup:
 Those numbers belong to the device, not to the kernel. The tiling policy is
 written once, parameterized by `(shared_memory_bytes, max_threads_per_group,
 simd_width)`, and each backend supplies its own values — M2 pays for that seam
-so M3 gets a tile size instead of a second hand-tuned kernel.
+so M3 gets a tile size instead of a second hand-tuned kernel. That seam now
+exists as `portable_attention.tiling`: on V3D at `head_dim=64` in float32 it
+plans a 16x16 tile filling the 256-invocation workgroup in 13440 of the 16384
+available bytes.
 
 ## M3 — Metal backend (Apple Silicon)
 
