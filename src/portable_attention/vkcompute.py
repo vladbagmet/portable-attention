@@ -378,11 +378,18 @@ class VulkanBuffer:
             A new array owning its memory — the buffer can be freed after.
 
         Raises:
-            VulkanError: When the buffer was freed, or the requested view does
-                not fit the allocation.
+            VulkanError: When the buffer was freed, ``dtype`` has no fixed
+                element size, ``shape`` has a negative dimension, or the
+                requested view does not fit the allocation.
         """
         address = self._live_address()
         element = np.dtype(dtype)
+        if element.itemsize <= 0:
+            # Flexible dtypes ('U', 'S0', 'V0') have no fixed element size, so
+            # neither the implicit length nor the byte budget below means anything.
+            raise VulkanError(f"dtype {element.str!r} has no fixed element size")
+        if shape is not None and any(dim < 0 for dim in shape):
+            raise VulkanError(f"shape {shape} has a negative dimension")
         if shape is None:
             if self._nbytes % element.itemsize:
                 raise VulkanError(

@@ -444,6 +444,27 @@ def test_buffer_read_rejects_ragged_flat_view() -> None:
         buf.read(np.float32)
 
 
+@pytest.mark.parametrize("dtype", ["U", "S0", "V0"])
+def test_buffer_read_rejects_sizeless_dtype(dtype: str) -> None:
+    """A flexible dtype has no element size, so it cannot describe a view."""
+    with (
+        _open(_FakeVulkan()) as ctx,
+        ctx.allocate(16) as buf,
+        pytest.raises(vc.VulkanError, match="no fixed element size"),
+    ):
+        buf.read(dtype, (2,))
+
+
+def test_buffer_read_rejects_negative_dimension() -> None:
+    """A negative dimension would shrink the byte count instead of growing it."""
+    with (
+        _open(_FakeVulkan()) as ctx,
+        ctx.allocate(16) as buf,
+        pytest.raises(vc.VulkanError, match="negative dimension"),
+    ):
+        buf.read(np.float32, (-1, 4))
+
+
 def test_freed_buffer_refuses_access() -> None:
     """Reads and writes after ``free`` raise instead of touching stale memory."""
     with _open(_FakeVulkan()) as ctx:
