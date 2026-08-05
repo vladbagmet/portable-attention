@@ -31,9 +31,19 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import ctypes.util
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from ._vkffi import (
+    VK_QUEUE_COMPUTE_BIT,
+    VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+    VK_SUCCESS,
+    VkInstanceCreateInfo,
+    VkPhysicalDeviceProperties,
+    VkQueueFamilyProperties,
+    format_api_version,
+)
+from ._vkffi import find_loader_name as _default_find_loader
 
 __all__ = [
     "VulkanCapability",
@@ -41,11 +51,6 @@ __all__ = [
     "detect_vulkan",
     "vulkan_available",
 ]
-
-_VK_SUCCESS = 0
-_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
-_VK_QUEUE_COMPUTE_BIT = 0x00000002
-_VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256
 
 _NO_LOADER_REASON = (
     "no Vulkan ICD loader found (libvulkan); install a Vulkan runtime such as Mesa V3DV"
@@ -104,88 +109,28 @@ class VulkanCapability:
         return tuple(device.name for device in self.devices)
 
 
-class _VkInstanceCreateInfo(ctypes.Structure):
-    """``VkInstanceCreateInfo`` with no layers, extensions or application info."""
-
-    _fields_ = (
-        ("sType", ctypes.c_uint32),
-        ("pNext", ctypes.c_void_p),
-        ("flags", ctypes.c_uint32),
-        ("pApplicationInfo", ctypes.c_void_p),
-        ("enabledLayerCount", ctypes.c_uint32),
-        ("ppEnabledLayerNames", ctypes.c_void_p),
-        ("enabledExtensionCount", ctypes.c_uint32),
-        ("ppEnabledExtensionNames", ctypes.c_void_p),
-    )
-
-
-class _VkPhysicalDeviceProperties(ctypes.Structure):
-    """Head of ``VkPhysicalDeviceProperties`` plus room for the rest.
-
-    Only ``apiVersion`` and ``deviceName`` are read here. The trailing
-    ``limits``/``sparseProperties`` members are large, version-stable in layout
-    but tedious to mirror, so they are reserved as opaque bytes; the reserve is
-    deliberately larger than any published size of the struct so the driver
-    always writes inside our allocation.
-    """
-
-    _fields_ = (
-        ("apiVersion", ctypes.c_uint32),
-        ("driverVersion", ctypes.c_uint32),
-        ("vendorID", ctypes.c_uint32),
-        ("deviceID", ctypes.c_uint32),
-        ("deviceType", ctypes.c_uint32),
-        ("deviceName", ctypes.c_char * _VK_MAX_PHYSICAL_DEVICE_NAME_SIZE),
-        ("pipelineCacheUUID", ctypes.c_uint8 * 16),
-        ("_reserved", ctypes.c_uint8 * 2048),
-    )
-
-
-class _VkQueueFamilyProperties(ctypes.Structure):
-    """``VkQueueFamilyProperties`` (all members are 32-bit unsigned)."""
-
-    _fields_ = (
-        ("queueFlags", ctypes.c_uint32),
-        ("queueCount", ctypes.c_uint32),
-        ("timestampValidBits", ctypes.c_uint32),
-        ("minImageTransferGranularityWidth", ctypes.c_uint32),
-        ("minImageTransferGranularityHeight", ctypes.c_uint32),
-        ("minImageTransferGranularityDepth", ctypes.c_uint32),
-    )
-
-
-def _format_api_version(packed: int) -> str:
-    """Format a packed Vulkan ``VK_MAKE_VERSION`` integer as ``"x.y.z"``."""
-    return f"{packed >> 22}.{(packed >> 12) & 0x3FF}.{packed & 0xFFF}"
-
-
-def _default_find_loader() -> str | None:
-    """Return the Vulkan ICD loader library name, or ``None`` if absent."""
-    return ctypes.util.find_library("vulkan")
-
-
 def _has_compute_queue(lib: ctypes.CDLL, device: ctypes.c_void_p) -> bool:
     """Return ``True`` when a queue family of ``device`` supports compute."""
     count = ctypes.c_uint32(0)
     lib.vkGetPhysicalDeviceQueueFamilyProperties(device, ctypes.pointer(count), None)
     if count.value == 0:
         return False
-    families = (_VkQueueFamilyProperties * count.value)()
+    families = (VkQueueFamilyProperties * count.value)()
     lib.vkGetPhysicalDeviceQueueFamilyProperties(
         device, ctypes.pointer(count), families
     )
     return any(
-        family.queueFlags & _VK_QUEUE_COMPUTE_BIT for family in families[: count.value]
+        family.queueFlags & VK_QUEUE_COMPUTE_BIT for family in families[: count.value]
     )
 
 
 def _describe_device(lib: ctypes.CDLL, device: ctypes.c_void_p) -> VulkanDevice:
     """Read one physical device's name, API version and compute capability."""
-    props = _VkPhysicalDeviceProperties()
+    props = VkPhysicalDeviceProperties()
     lib.vkGetPhysicalDeviceProperties(device, ctypes.pointer(props))
     return VulkanDevice(
         name=props.deviceName.decode("utf-8", "replace"),
-        api_version=_format_api_version(props.apiVersion),
+        api_version=format_api_version(props.apiVersion),
         compute=_has_compute_queue(lib, device),
     )
 
@@ -196,11 +141,11 @@ def _enumerate_devices(
     """Describe every physical device visible to ``instance``."""
     count = ctypes.c_uint32(0)
     counted = lib.vkEnumeratePhysicalDevices(instance, ctypes.pointer(count), None)
-    if counted != _VK_SUCCESS or count.value == 0:
+    if counted != VK_SUCCESS or count.value == 0:
         return []
     handles = (ctypes.c_void_p * count.value)()
     filled = lib.vkEnumeratePhysicalDevices(instance, ctypes.pointer(count), handles)
-    if filled != _VK_SUCCESS:
+    if filled != VK_SUCCESS:
         return []
     return [
         _describe_device(lib, ctypes.c_void_p(handle))
@@ -227,13 +172,13 @@ def _default_probe_devices(loader: str) -> tuple[VulkanDevice, ...]:
         lib = ctypes.CDLL(loader)
     except OSError:
         return ()
-    create_info = _VkInstanceCreateInfo(sType=_VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
+    create_info = VkInstanceCreateInfo(sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
     instance = ctypes.c_void_p()
     try:
         status = lib.vkCreateInstance(
             ctypes.pointer(create_info), None, ctypes.pointer(instance)
         )
-        if status != _VK_SUCCESS or not instance:
+        if status != VK_SUCCESS or not instance:
             return ()
         try:
             return tuple(_enumerate_devices(lib, instance))

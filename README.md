@@ -131,6 +131,39 @@ The loader is called with `ctypes`, so detection adds no runtime dependency —
 no Python Vulkan binding is needed or used. It opens no device and submits no
 GPU work; a host without Vulkan reports `available=False` rather than failing.
 
+### Opening a Vulkan device
+
+Detection says a device is there; `VulkanContext` opens it. The context creates
+a logical device with one compute queue and allocates storage buffers whose
+memory stays mapped, so arrays move in and out as plain copies:
+
+```python
+import numpy as np
+
+from portable_attention import VulkanContext
+
+q = np.random.default_rng(0).standard_normal((4, 64), dtype=np.float32)
+
+with VulkanContext.open() as ctx:
+    print(ctx.device_name, ctx.queue_family_index)  # V3D 7.1.7.0 0
+    with ctx.allocate(q.nbytes) as buf:
+        buf.write(q)
+        same = buf.read(q.dtype, q.shape)
+```
+
+`open()` takes the first compute-capable device by default; `device_index=`
+selects one from the enumeration order that `detect_vulkan()` reports. Memory is
+chosen from the types the buffer allows, requiring `HOST_VISIBLE | HOST_COHERENT`
+and preferring `DEVICE_LOCAL` as well — on unified-memory parts such as V3D that
+is the same heap, so no staging copy is needed. Buffers are created with
+`STORAGE_BUFFER` usage, which is what a compute shader binds.
+
+The context owns what it creates: closing it frees buffers the caller forgot,
+then destroys the device and the instance. Both the context and its buffers work
+as context managers, and `close()`/`free()` are idempotent. Anything that fails
+raises `VulkanError` naming the entry point and the `VkResult`. No shader runs
+yet — this is the allocation and transfer path the kernel will sit on.
+
 ### Tile sizing
 
 A blocked (flash-style) attention kernel streams the key/value sequence in
