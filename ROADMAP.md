@@ -44,6 +44,8 @@ reproducible benchmark harness.
   report which can run compute. *(done: `detect_vulkan`)*
 - **Tile sizing policy** — one device-parameterized planner shared by every
   blocked backend. *(done: `plan_tiles`)*
+- **Device open + host transfer** — a logical device with a compute queue and
+  mapped storage buffers arrays travel through. *(done: `VulkanContext`)*
 - **Backend registration** gated on a compute-capable device, driving a minimal
   SPIR-V attention kernel, validated against the reference oracle through the
   conformance kit.

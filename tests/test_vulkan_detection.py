@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 from typing import Any
 
 import pytest
@@ -193,7 +194,7 @@ def test_default_find_loader_probes_vulkan(monkeypatch: pytest.MonkeyPatch) -> N
         calls.append(name)
         return "libvulkan.so.sentinel"
 
-    monkeypatch.setattr(vk.ctypes.util, "find_library", fake_find_library)
+    monkeypatch.setattr(ctypes.util, "find_library", fake_find_library)
     assert vk._default_find_loader() == "libvulkan.so.sentinel"
     assert calls == ["vulkan"]
 

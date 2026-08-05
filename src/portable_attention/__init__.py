@@ -19,6 +19,10 @@ across the documented contract matrix.
 Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
 :class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
 shared-memory / workgroup / SIMD numbers instead of a second hand-tuned kernel.
+
+On hosts with Vulkan, :func:`detect_vulkan` reports what hardware is there and
+:class:`VulkanContext` opens it: a logical device, a compute queue, and
+host-visible :class:`VulkanBuffer` allocations arrays can be copied through.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from .tiling import (
     plan_tiles,
     shared_memory_bytes_for,
 )
+from .vkcompute import VulkanBuffer, VulkanContext, VulkanError
 from .vulkan import VulkanCapability, VulkanDevice, detect_vulkan, vulkan_available
 
 __all__ = [
@@ -53,8 +58,11 @@ __all__ = [
     "SdpaBackend",
     "TilePlan",
     "TileSizingError",
+    "VulkanBuffer",
     "VulkanCapability",
+    "VulkanContext",
     "VulkanDevice",
+    "VulkanError",
     "__version__",
     "assert_conforms",
     "available_backends",
