@@ -186,10 +186,10 @@ with VulkanContext.open() as ctx:
     with ctx.compute_pipeline(spirv, buffer_count=2, push_constant_bytes=8) as pipe:
         pipe.dispatch(
             [src, dst],
-            groups=(data.size + 63) // 64,          # workgroups, not invocations
+            groups=(data.size + 63) // 64,  # workgroups, not invocations
             push_constants=struct.pack("<If", data.size, 2.0),
         )
-    print(dst.read(np.float32, data.shape))         # data * 2.0
+    print(dst.read(np.float32, data.shape))  # data * 2.0
 ```
 
 `groups` is the number of workgroups — divide the problem size by the shader's
