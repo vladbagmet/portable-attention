@@ -36,6 +36,7 @@ def test_public_exports_are_frozen():
         "VulkanContext",
         "VulkanDevice",
         "VulkanError",
+        "VulkanPipeline",
         "__version__",
         "assert_conforms",
         "available_backends",

@@ -1,8 +1,10 @@
-"""Tests for the Vulkan compute context (device, queue and mapped buffers)."""
+"""Tests for the Vulkan compute context (device, buffers and shader dispatch)."""
 
 from __future__ import annotations
 
 import ctypes
+import struct
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -10,11 +12,17 @@ import pytest
 
 import portable_attention as pa
 from portable_attention import vkcompute as vc
-from portable_attention.vulkan import vulkan_available
+from portable_attention.vulkan import detect_vulkan, vulkan_available
 
 _INSTANCE = 0xBEEF
 _DEVICE = 0xD3D1
 _QUEUE = 0x0EE0
+
+# out[i] = in[i] * scale, compiled from tests/shaders/double.comp. Two storage
+# buffers, an 8-byte push-constant block (uint count, float scale), 64 threads
+# per workgroup.
+_DOUBLE_SPV = Path(__file__).parent / "shaders" / "double.spv"
+_DOUBLE_LOCAL_SIZE = 64
 
 _COMPUTE_QUEUE = 0x2
 _GRAPHICS_QUEUE = 0x1
@@ -55,6 +63,8 @@ class _FakeVulkan:
         self.bound: list[tuple[int, int]] = []
         self.mapped: set[int] = set()
         self.events: list[str] = []
+        self.descriptors: list[tuple[int, int]] = []
+        self.push_constants = b""
         self._next_handle = 1
 
     def _status(self, name: str) -> int:
@@ -186,6 +196,200 @@ class _FakeVulkan:
         self.buffer_sizes.pop(buffer.value, None)
         self.events.append("destroy-buffer")
 
+    # -- pipeline objects -------------------------------------------------
+    def _create(self, name: str, out: Any, event: str) -> int:
+        """Emulate a ``vkCreate*`` that writes one handle through a pointer."""
+        status = self._status(name)
+        if status != 0:
+            return status
+        out[0] = self._handle()
+        self.events.append(event)
+        return status
+
+    def vkCreateShaderModule(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, module: Any
+    ) -> int:
+        self.shader_words = info.contents.codeSize // 4
+        return self._create("vkCreateShaderModule", module, "create-shader")
+
+    def vkDestroyShaderModule(self, device: Any, module: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-shader")
+
+    def vkCreateDescriptorSetLayout(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, layout: Any
+    ) -> int:
+        self.binding_count = info.contents.bindingCount
+        return self._create("vkCreateDescriptorSetLayout", layout, "create-set-layout")
+
+    def vkDestroyDescriptorSetLayout(  # noqa: N802
+        self, device: Any, layout: Any, allocator: Any
+    ) -> None:
+        self.events.append("destroy-set-layout")
+
+    def vkCreateDescriptorPool(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, pool: Any
+    ) -> int:
+        assert info.contents.maxSets == 1
+        return self._create("vkCreateDescriptorPool", pool, "create-descriptor-pool")
+
+    def vkDestroyDescriptorPool(self, device: Any, pool: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-descriptor-pool")
+
+    def vkAllocateDescriptorSets(self, device: Any, info: Any, sets: Any) -> int:  # noqa: N802
+        return self._create("vkAllocateDescriptorSets", sets, "allocate-set")
+
+    def vkCreatePipelineLayout(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, layout: Any
+    ) -> int:
+        self.push_constant_ranges = info.contents.pushConstantRangeCount
+        return self._create("vkCreatePipelineLayout", layout, "create-pipeline-layout")
+
+    def vkDestroyPipelineLayout(self, device: Any, layout: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-pipeline-layout")
+
+    def vkCreateComputePipelines(  # noqa: N802
+        self,
+        device: Any,
+        cache: Any,
+        count: Any,
+        infos: Any,
+        allocator: Any,
+        pipelines: Any,
+    ) -> int:
+        assert count.value == 1
+        self.entry_point = infos.contents.stage.pName
+        return self._create("vkCreateComputePipelines", pipelines, "create-pipeline")
+
+    def vkDestroyPipeline(self, device: Any, pipeline: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-pipeline")
+
+    def vkCreateCommandPool(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, pool: Any
+    ) -> int:
+        self.command_pool_family = info.contents.queueFamilyIndex
+        return self._create("vkCreateCommandPool", pool, "create-command-pool")
+
+    def vkDestroyCommandPool(self, device: Any, pool: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-command-pool")
+
+    def vkAllocateCommandBuffers(self, device: Any, info: Any, buffers: Any) -> int:  # noqa: N802
+        return self._create("vkAllocateCommandBuffers", buffers, "allocate-command")
+
+    def vkCreateFence(  # noqa: N802
+        self, device: Any, info: Any, allocator: Any, fence: Any
+    ) -> int:
+        return self._create("vkCreateFence", fence, "create-fence")
+
+    def vkDestroyFence(self, device: Any, fence: Any, allocator: Any) -> None:  # noqa: N802
+        self.events.append("destroy-fence")
+
+    # -- recording / submission -------------------------------------------
+    def vkUpdateDescriptorSets(  # noqa: N802
+        self, device: Any, write_count: Any, writes: Any, copy_count: Any, copies: Any
+    ) -> None:
+        self.descriptors = [
+            (
+                writes[index].dstBinding,
+                ctypes.cast(
+                    writes[index].pBufferInfo,
+                    ctypes.POINTER(vc._VkDescriptorBufferInfo),
+                ).contents.buffer,
+            )
+            for index in range(write_count.value)
+        ]
+        self.events.append("update-descriptors")
+
+    def vkResetCommandBuffer(self, command_buffer: Any, flags: Any) -> int:  # noqa: N802
+        self.events.append("reset-command")
+        return self._status("vkResetCommandBuffer")
+
+    def vkBeginCommandBuffer(self, command_buffer: Any, info: Any) -> int:  # noqa: N802
+        self.events.append("begin")
+        return self._status("vkBeginCommandBuffer")
+
+    def vkCmdBindPipeline(  # noqa: N802
+        self, command_buffer: Any, bind_point: Any, pipeline: Any
+    ) -> None:
+        assert bind_point.value == 1
+        self.events.append("bind-pipeline")
+
+    def vkCmdBindDescriptorSets(  # noqa: N802
+        self,
+        command_buffer: Any,
+        bind_point: Any,
+        layout: Any,
+        first_set: Any,
+        set_count: Any,
+        sets: Any,
+        offset_count: Any,
+        offsets: Any,
+    ) -> None:
+        self.events.append("bind-sets")
+
+    def vkCmdPushConstants(  # noqa: N802
+        self,
+        command_buffer: Any,
+        layout: Any,
+        stages: Any,
+        offset: Any,
+        size: Any,
+        values: Any,
+    ) -> None:
+        self.push_constants = bytes(values)[: size.value]
+        self.events.append("push-constants")
+
+    def vkCmdDispatch(self, command_buffer: Any, x: Any, y: Any, z: Any) -> None:  # noqa: N802
+        self.groups = (x.value, y.value, z.value)
+        self.events.append("dispatch")
+
+    def vkCmdPipelineBarrier(  # noqa: N802
+        self,
+        command_buffer: Any,
+        src_stage: Any,
+        dst_stage: Any,
+        flags: Any,
+        memory_count: Any,
+        memory: Any,
+        buffer_count: Any,
+        buffers: Any,
+        image_count: Any,
+        images: Any,
+    ) -> None:
+        self.barrier = (
+            src_stage.value,
+            dst_stage.value,
+            memory.contents.srcAccessMask,
+            memory.contents.dstAccessMask,
+        )
+        self.events.append("barrier")
+
+    def vkEndCommandBuffer(self, command_buffer: Any) -> int:  # noqa: N802
+        self.events.append("end")
+        return self._status("vkEndCommandBuffer")
+
+    def vkResetFences(self, device: Any, count: Any, fences: Any) -> int:  # noqa: N802
+        self.events.append("reset-fences")
+        return self._status("vkResetFences")
+
+    def vkQueueSubmit(  # noqa: N802
+        self, queue: Any, count: Any, submits: Any, fence: Any
+    ) -> int:
+        assert queue.value == _QUEUE
+        assert submits.contents.commandBufferCount == 1
+        self.events.append("submit")
+        return self._status("vkQueueSubmit")
+
+    def vkWaitForFences(  # noqa: N802
+        self, device: Any, count: Any, fences: Any, wait_all: Any, timeout: Any
+    ) -> int:
+        self.wait_timeout_ns = timeout.value
+        self.events.append("wait")
+        return self._status("vkWaitForFences")
+
+    def vkDeviceWaitIdle(self, device: Any) -> int:  # noqa: N802
+        self.events.append("device-idle")
+        return 0
+
 
 def _open(lib: _FakeVulkan, **kwargs: Any) -> vc.VulkanContext:
     """Open a context against ``lib`` instead of the system loader."""
@@ -201,9 +405,19 @@ def _open(lib: _FakeVulkan, **kwargs: Any) -> vc.VulkanContext:
 # --------------------------------------------------------------------------
 
 
+def _spirv(words: list[int] | None = None) -> bytes:
+    """Build a minimal well-formed SPIR-V header, or read the real kernel."""
+    if words is None:
+        return _DOUBLE_SPV.read_bytes()
+    return b"".join(word.to_bytes(4, "little") for word in words)
+
+
+_MINIMAL_SPIRV = _spirv([0x07230203, 0x00010000, 0, 1, 0])
+
+
 def test_public_reexports() -> None:
     """The context, buffer and error type are top-level exports."""
-    for name in ("VulkanBuffer", "VulkanContext", "VulkanError"):
+    for name in ("VulkanBuffer", "VulkanContext", "VulkanError", "VulkanPipeline"):
         assert getattr(pa, name) is getattr(vc, name)
         assert name in pa.__all__
 
@@ -557,6 +771,450 @@ def test_allocation_rejects_invalid_sizes(nbytes: object) -> None:
 
 
 # --------------------------------------------------------------------------
+# pipeline argument validation (pure)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("not bytes", "must be bytes-like"),
+        (b"", "whole number of 32-bit words"),
+        (b"\x03\x02#\x07\x00", "whole number of 32-bit words"),
+        (b"\x07#\x02\x03", "byte-swapped"),
+        (b"\x00\x00\x00\x00", "not a SPIR-V module"),
+    ],
+)
+def test_spirv_header_is_validated(code: object, message: str) -> None:
+    """A module the driver would reject (or crash on) is caught first."""
+    with pytest.raises(vc.VulkanError, match=message):
+        vc._require_spirv(code)
+
+
+def test_spirv_accepts_bytes_like_input() -> None:
+    """``bytearray`` and ``memoryview`` are copied, not refused."""
+    assert vc._require_spirv(bytearray(_MINIMAL_SPIRV)) == _MINIMAL_SPIRV
+    assert vc._require_spirv(memoryview(_MINIMAL_SPIRV)) == _MINIMAL_SPIRV
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 2.0, "2"])
+def test_buffer_count_must_be_a_positive_int(count: object) -> None:
+    """Binding counts index descriptor slots, so only positive ints make sense."""
+    with pytest.raises(vc.VulkanError, match="buffer_count must be"):
+        vc._require_buffer_count(count)
+
+
+@pytest.mark.parametrize(
+    ("size", "message"),
+    [
+        (-4, "non-negative integer"),
+        (True, "non-negative integer"),
+        (4.0, "non-negative integer"),
+        (6, "multiple of 4"),
+        (132, "exceeds the 128 bytes"),
+    ],
+)
+def test_push_constant_size_is_validated(size: object, message: str) -> None:
+    """Push-constant blocks must be word-sized and inside the portable floor."""
+    with pytest.raises(vc.VulkanError, match=message):
+        vc._require_push_constant_bytes(size)
+
+
+@pytest.mark.parametrize("size", [0, 4, 128])
+def test_push_constant_size_accepts_the_portable_range(size: int) -> None:
+    """No block, one word, and the 128 bytes every implementation has all pass."""
+    assert vc._require_push_constant_bytes(size) == size
+
+
+@pytest.mark.parametrize(
+    ("groups", "expected"),
+    [(7, (7, 1, 1)), ((3,), (3, 1, 1)), ((3, 2), (3, 2, 1)), ([3, 2, 1], (3, 2, 1))],
+)
+def test_groups_pad_to_three_dimensions(
+    groups: object, expected: tuple[int, int, int]
+) -> None:
+    """Workgroup counts accept 1-3 axes and default the rest to one."""
+    assert vc._require_groups(groups) == expected  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("groups", "message"),
+    [
+        ((), "1 to 3 dimensions"),
+        ((1, 1, 1, 1), "1 to 3 dimensions"),
+        ((1, 0), "must be positive integers"),
+        ((1.5,), "must be positive integers"),
+        (True, "must be positive integers"),
+        ((1, 65536), "exceeds the 65535 per axis"),
+    ],
+)
+def test_groups_reject_nonsense(groups: object, message: str) -> None:
+    """An empty, non-positive or unportably large workgroup count is an error."""
+    with pytest.raises(vc.VulkanError, match=message):
+        vc._require_groups(groups)  # type: ignore[arg-type]
+
+
+def test_groups_accept_the_portable_maximum() -> None:
+    """The guaranteed 65535 per axis is allowed, one more is not."""
+    assert vc._require_groups((65535, 65535, 65535)) == (65535, 65535, 65535)
+
+
+# --------------------------------------------------------------------------
+# building and dispatching a pipeline
+# --------------------------------------------------------------------------
+
+
+def test_pipeline_creates_every_object_it_needs() -> None:
+    """Building a pipeline walks the full create sequence once."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=3, push_constant_bytes=8
+        )
+        assert (pipeline.buffer_count, pipeline.push_constant_bytes) == (3, 8)
+        assert pipeline.dispatch_count == 0
+        assert ctx.live_pipelines == 1
+        assert lib.events == [
+            "create-shader",
+            "create-set-layout",
+            "create-descriptor-pool",
+            "allocate-set",
+            "create-pipeline-layout",
+            "create-pipeline",
+            "create-command-pool",
+            "allocate-command",
+            "create-fence",
+        ]
+        assert lib.shader_words == len(_MINIMAL_SPIRV) // 4
+        assert lib.binding_count == 3
+        assert lib.push_constant_ranges == 1
+        assert lib.entry_point == b"main"
+        assert lib.command_pool_family == ctx.queue_family_index
+
+
+def test_pipeline_without_push_constants_declares_no_range() -> None:
+    """A shader with no push constants gets an empty range list."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        assert lib.push_constant_ranges == 0
+
+
+def test_pipeline_honours_a_custom_entry_point() -> None:
+    """``entry_point`` reaches the shader stage as a NUL-terminated name."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1, entry_point="attention")
+        assert lib.entry_point == b"attention"
+
+
+def test_dispatch_records_bindings_constants_and_barrier() -> None:
+    """One dispatch binds each buffer in order and ends with a host barrier."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        src = ctx.allocate(64)
+        dst = ctx.allocate(64)
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=2, push_constant_bytes=8
+        )
+        payload = struct.pack("<If", 16, 2.0)
+        lib.events.clear()
+        pipeline.dispatch([src, dst], groups=(4, 2), push_constants=payload)
+
+        assert lib.events == [
+            "update-descriptors",
+            "reset-command",
+            "begin",
+            "bind-pipeline",
+            "bind-sets",
+            "push-constants",
+            "dispatch",
+            "barrier",
+            "end",
+            "reset-fences",
+            "submit",
+            "wait",
+        ]
+        assert lib.descriptors == [(0, src.handle), (1, dst.handle)]
+        assert lib.push_constants == payload
+        assert lib.groups == (4, 2, 1)
+        # compute-shader writes -> host reads
+        assert lib.barrier == (0x800, 0x4000, 0x40, 0x2000)
+        assert pipeline.dispatch_count == 1
+
+
+def test_dispatch_skips_push_constants_when_there_are_none() -> None:
+    """A pipeline with no push-constant block records no push command."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        lib.events.clear()
+        pipeline.dispatch([buf], groups=1)
+        assert "push-constants" not in lib.events
+
+
+def test_dispatch_reuses_the_command_buffer() -> None:
+    """A second dispatch re-records rather than allocating new objects."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        pipeline.dispatch([buf], groups=1)
+        pipeline.dispatch([buf], groups=2)
+        assert pipeline.dispatch_count == 2
+        assert lib.groups == (2, 1, 1)
+        assert lib.events.count("allocate-command") == 1
+        assert lib.events.count("reset-command") == 2
+
+
+def test_dispatch_converts_the_timeout_to_nanoseconds() -> None:
+    """``timeout_s`` reaches ``vkWaitForFences`` in its own unit."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        pipeline.dispatch([buf], groups=1, timeout_s=0.25)
+        assert lib.wait_timeout_ns == 250_000_000
+
+
+def test_dispatch_rejects_the_wrong_number_of_buffers() -> None:
+    """The buffer list has to match the descriptor set the pipeline was built for."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=2)
+        with pytest.raises(vc.VulkanError, match=r"binds 2 buffer\(s\), got 1"):
+            pipeline.dispatch([buf], groups=1)
+
+
+def test_dispatch_rejects_a_mismatched_push_constant_block() -> None:
+    """Push-constant payloads must be exactly the declared size."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=1, push_constant_bytes=8
+        )
+        with pytest.raises(vc.VulkanError, match="declares 8 push-constant"):
+            pipeline.dispatch([buf], groups=1, push_constants=b"\x00\x00\x00\x00")
+        with pytest.raises(vc.VulkanError, match="declares 8 push-constant"):
+            pipeline.dispatch([buf], groups=1)
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0])
+def test_dispatch_rejects_a_non_positive_timeout(timeout: float) -> None:
+    """Waiting for zero time would report a healthy device as wedged."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match="timeout_s must be positive"):
+            pipeline.dispatch([buf], groups=1, timeout_s=timeout)
+
+
+def test_dispatch_rejects_a_freed_buffer() -> None:
+    """Binding a freed buffer is caught instead of passing a stale handle."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        buf.free()
+        with pytest.raises(vc.VulkanError, match="has been freed"):
+            pipeline.dispatch([buf], groups=1)
+
+
+def test_pipeline_after_close_fails() -> None:
+    """A closed context has no device to compile a shader for."""
+    ctx = _open(_FakeVulkan())
+    ctx.close()
+    with pytest.raises(vc.VulkanError, match="context is closed"):
+        ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+
+
+@pytest.mark.parametrize(
+    ("entry_point", "expected_teardown"),
+    [
+        ("vkCreateShaderModule", []),
+        ("vkCreateDescriptorSetLayout", ["destroy-shader"]),
+        (
+            "vkCreateDescriptorPool",
+            ["destroy-set-layout", "destroy-shader"],
+        ),
+        (
+            "vkAllocateDescriptorSets",
+            ["destroy-descriptor-pool", "destroy-set-layout", "destroy-shader"],
+        ),
+        (
+            "vkCreatePipelineLayout",
+            ["destroy-descriptor-pool", "destroy-set-layout", "destroy-shader"],
+        ),
+        (
+            "vkCreateComputePipelines",
+            [
+                "destroy-pipeline-layout",
+                "destroy-descriptor-pool",
+                "destroy-set-layout",
+                "destroy-shader",
+            ],
+        ),
+        (
+            "vkCreateCommandPool",
+            [
+                "destroy-pipeline",
+                "destroy-pipeline-layout",
+                "destroy-descriptor-pool",
+                "destroy-set-layout",
+                "destroy-shader",
+            ],
+        ),
+        (
+            "vkAllocateCommandBuffers",
+            [
+                "destroy-command-pool",
+                "destroy-pipeline",
+                "destroy-pipeline-layout",
+                "destroy-descriptor-pool",
+                "destroy-set-layout",
+                "destroy-shader",
+            ],
+        ),
+        (
+            "vkCreateFence",
+            [
+                "destroy-command-pool",
+                "destroy-pipeline",
+                "destroy-pipeline-layout",
+                "destroy-descriptor-pool",
+                "destroy-set-layout",
+                "destroy-shader",
+            ],
+        ),
+    ],
+)
+def test_pipeline_build_failure_unwinds(
+    entry_point: str, expected_teardown: list[str]
+) -> None:
+    """A failure part-way through creation destroys what already exists."""
+    lib = _FakeVulkan(fail={entry_point: -1})
+    with _open(lib) as ctx:
+        with pytest.raises(vc.VulkanError, match=f"{entry_point} failed"):
+            ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=2)
+        assert ctx.live_pipelines == 0
+        teardown = [event for event in lib.events if event.startswith("destroy-")]
+        assert teardown == expected_teardown
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [
+        "vkResetCommandBuffer",
+        "vkBeginCommandBuffer",
+        "vkEndCommandBuffer",
+        "vkResetFences",
+        "vkQueueSubmit",
+    ],
+)
+def test_dispatch_propagates_entry_point_failures(entry_point: str) -> None:
+    """Every recording and submission step reports the call that failed."""
+    lib = _FakeVulkan(fail={entry_point: -4})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(
+            vc.VulkanError, match=f"{entry_point} failed: VK_ERROR_DEVICE_LOST"
+        ):
+            pipeline.dispatch([buf], groups=1)
+        assert pipeline.dispatch_count == 0
+
+
+def test_dispatch_reports_a_fence_timeout() -> None:
+    """A device that never signals is an error, not a silently short read."""
+    lib = _FakeVulkan(fail={"vkWaitForFences": 2})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match=r"after 0.5s\) failed: VK_TIMEOUT"):
+            pipeline.dispatch([buf], groups=1, timeout_s=0.5)
+
+
+def test_a_timed_out_pipeline_refuses_further_dispatch() -> None:
+    """The submission is still in flight, so nothing may be re-recorded."""
+    lib = _FakeVulkan(fail={"vkWaitForFences": 2})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match="VK_TIMEOUT"):
+            pipeline.dispatch([buf], groups=1)
+        with pytest.raises(vc.VulkanError, match="earlier dispatch never completed"):
+            pipeline.dispatch([buf], groups=1)
+        assert lib.events.count("reset-command") == 1
+
+
+def test_a_timed_out_pipeline_drains_the_device_before_destroy() -> None:
+    """Objects a pending submission references are only destroyed after idle."""
+    lib = _FakeVulkan(fail={"vkWaitForFences": 2})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match="VK_TIMEOUT"):
+            pipeline.dispatch([buf], groups=1)
+        pipeline.destroy()
+    assert lib.events.index("device-idle") < lib.events.index("destroy-command-pool")
+
+
+def test_pipeline_destroy_is_idempotent() -> None:
+    """Destroying twice releases each Vulkan object once."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        pipeline.destroy()
+        pipeline.destroy()
+        assert pipeline.destroyed is True
+        assert ctx.live_pipelines == 0
+    assert lib.events.count("destroy-pipeline") == 1
+    assert lib.events.count("destroy-fence") == 1
+
+
+def test_destroyed_pipeline_refuses_dispatch() -> None:
+    """Dispatching after destroy raises instead of using dead handles."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        pipeline.destroy()
+        with pytest.raises(vc.VulkanError, match="pipeline has been destroyed"):
+            pipeline.dispatch([buf], groups=1)
+
+
+def test_pipeline_is_a_context_manager() -> None:
+    """Leaving the ``with`` block destroys the pipeline."""
+    lib = _FakeVulkan()
+    with (
+        _open(lib) as ctx,
+        ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1) as pipeline,
+    ):
+        assert pipeline.destroyed is False
+    assert pipeline.destroyed is True
+
+
+def test_close_destroys_outstanding_pipelines_before_the_device() -> None:
+    """The context cleans up pipelines the caller forgot, in the right order."""
+    lib = _FakeVulkan()
+    ctx = _open(lib)
+    pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+    ctx.close()
+    assert pipeline.destroyed is True
+    assert ctx.live_pipelines == 0
+    assert lib.events.index("destroy-pipeline") < lib.events.index("destroy-device")
+
+
+def test_freed_buffer_has_no_handle() -> None:
+    """The descriptor handle of a freed buffer is refused, not stale."""
+    with _open(_FakeVulkan()) as ctx:
+        buf = ctx.allocate(16)
+        assert buf.handle > 0
+        buf.free()
+        with pytest.raises(vc.VulkanError, match="has been freed"):
+            _ = buf.handle
+
+
+# --------------------------------------------------------------------------
 # lifetime
 # --------------------------------------------------------------------------
 
@@ -620,3 +1278,46 @@ def test_roundtrip_on_a_real_device() -> None:
             buf.write(data)
             assert np.array_equal(buf.read(data.dtype, data.shape), data)
         assert ctx.live_buffers == 0
+
+
+def _compute_device_indices() -> list[int]:
+    """Indices of every enumerated device that can run compute, or ``[]``."""
+    capability = detect_vulkan()
+    return [index for index, device in enumerate(capability.devices) if device.compute]
+
+
+@pytest.mark.skipif(not vulkan_available(), reason="no Vulkan compute device")
+@pytest.mark.parametrize("device_index", _compute_device_indices())
+def test_dispatch_on_a_real_device(device_index: int) -> None:
+    """Every compute device on this host runs the kernel and returns its result.
+
+    Scales 1000 floats by a push constant, which exercises the whole submission
+    path: descriptor writes, push constants, dispatch, barrier and fence wait.
+    Runs once per compute-capable device, so a host with both a GPU and a
+    software implementation checks both.
+    """
+    data = np.arange(1000, dtype=np.float32)
+    groups = (data.size + _DOUBLE_LOCAL_SIZE - 1) // _DOUBLE_LOCAL_SIZE
+    with vc.VulkanContext.open(device_index=device_index) as ctx:
+        src = ctx.allocate(data.nbytes)
+        dst = ctx.allocate(data.nbytes)
+        src.write(data)
+        with ctx.compute_pipeline(
+            _spirv(), buffer_count=2, push_constant_bytes=8
+        ) as pipeline:
+            pipeline.dispatch(
+                [src, dst],
+                groups=groups,
+                push_constants=struct.pack("<If", data.size, 2.0),
+            )
+            assert np.array_equal(dst.read(np.float32, data.shape), data * 2.0)
+
+            # The same pipeline re-dispatched with new constants.
+            pipeline.dispatch(
+                [src, dst],
+                groups=groups,
+                push_constants=struct.pack("<If", data.size, -0.5),
+            )
+            assert np.array_equal(dst.read(np.float32, data.shape), data * -0.5)
+            assert pipeline.dispatch_count == 2
+        assert ctx.live_pipelines == 0

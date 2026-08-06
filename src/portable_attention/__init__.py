@@ -22,7 +22,8 @@ shared-memory / workgroup / SIMD numbers instead of a second hand-tuned kernel.
 
 On hosts with Vulkan, :func:`detect_vulkan` reports what hardware is there and
 :class:`VulkanContext` opens it: a logical device, a compute queue, and
-host-visible :class:`VulkanBuffer` allocations arrays can be copied through.
+host-visible :class:`VulkanBuffer` allocations arrays can be copied through,
+which a :class:`VulkanPipeline` then runs SPIR-V compute shaders over.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ from .tiling import (
     plan_tiles,
     shared_memory_bytes_for,
 )
-from .vkcompute import VulkanBuffer, VulkanContext, VulkanError
+from .vkcompute import VulkanBuffer, VulkanContext, VulkanError, VulkanPipeline
 from .vulkan import VulkanCapability, VulkanDevice, detect_vulkan, vulkan_available
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "VulkanContext",
     "VulkanDevice",
     "VulkanError",
+    "VulkanPipeline",
     "__version__",
     "assert_conforms",
     "available_backends",
