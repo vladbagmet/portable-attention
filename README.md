@@ -171,13 +171,14 @@ order they are passed to `dispatch()`:
 
 ```python
 import struct
+from pathlib import Path
 
 import numpy as np
 
 from portable_attention import VulkanContext
 
 data = np.arange(1000, dtype=np.float32)
-spirv = open("scale.spv", "rb").read()  # glslangValidator -V -S comp ...
+spirv = Path("scale.spv").read_bytes()  # glslangValidator -V -S comp ...
 
 with VulkanContext.open() as ctx:
     src = ctx.allocate(data.nbytes)

@@ -99,6 +99,10 @@ _SPIRV_MAGIC_SWAPPED = 0x03022307
 # Vulkan guarantees at least this much push-constant space on every
 # implementation, so staying inside it keeps a kernel portable by construction.
 _MIN_MAX_PUSH_CONSTANTS_SIZE = 128
+# Likewise the guaranteed floor for maxComputeWorkGroupCount on each axis. It is
+# also well inside the 32-bit range vkCmdDispatch takes, so a count that passes
+# cannot wrap on the way to the driver.
+_MIN_MAX_WORKGROUP_COUNT = 65535
 
 _VK_SHARING_MODE_EXCLUSIVE = 0
 _VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001
@@ -540,6 +544,11 @@ def _require_groups(groups: int | Sequence[int]) -> tuple[int, int, int]:
             raise VulkanError(
                 f"workgroup counts must be positive integers, got {counts}"
             )
+        if count > _MIN_MAX_WORKGROUP_COUNT:
+            raise VulkanError(
+                f"workgroup count {count} exceeds the {_MIN_MAX_WORKGROUP_COUNT} "
+                "per axis every Vulkan implementation guarantees"
+            )
     padded = counts + (1,) * (3 - len(counts))
     return padded[0], padded[1], padded[2]
 
@@ -824,6 +833,7 @@ class VulkanPipeline:
         self._push_constant_bytes = push_constant_bytes
         self._release = release
         self._destroyed = False
+        self._pending = False
         self._dispatch_count = 0
 
     @property
@@ -869,12 +879,17 @@ class VulkanPipeline:
                 returning quietly with a half-written buffer.
 
         Raises:
-            VulkanError: When the pipeline was destroyed, the arguments do not
-                match what it was built for, a buffer has been freed, or a
-                Vulkan entry point fails or times out.
+            VulkanError: When the pipeline was destroyed, an earlier dispatch
+                never completed, the arguments do not match what the pipeline
+                was built for, a buffer has been freed, or a Vulkan entry point
+                fails or times out.
         """
         if self._destroyed:
             raise VulkanError("pipeline has been destroyed")
+        if self._pending:
+            raise VulkanError(
+                "an earlier dispatch never completed; this pipeline cannot be reused"
+            )
         if timeout_s <= 0:
             raise VulkanError(f"timeout_s must be positive, got {timeout_s!r}")
         bound = tuple(buffers)
@@ -1013,23 +1028,32 @@ class VulkanPipeline:
             ),
             "vkQueueSubmit",
         )
-        _check(
-            lib.vkWaitForFences(
-                self._device,
-                ctypes.c_uint32(1),
-                fences,
-                ctypes.c_uint32(_VK_TRUE),
-                ctypes.c_uint64(int(timeout_s * 1e9)),
-            ),
-            f"vkWaitForFences (after {timeout_s}s)",
+        status = lib.vkWaitForFences(
+            self._device,
+            ctypes.c_uint32(1),
+            fences,
+            ctypes.c_uint32(_VK_TRUE),
+            ctypes.c_uint64(int(timeout_s * 1e9)),
         )
+        if status != VK_SUCCESS:
+            # The submission is still in flight, so the command buffer and every
+            # object it references must not be reset or destroyed from here.
+            self._pending = True
+        _check(status, f"vkWaitForFences (after {timeout_s}s)")
 
     def destroy(self) -> None:
-        """Release every Vulkan object of the pipeline. Safe to call twice."""
+        """Release every Vulkan object of the pipeline. Safe to call twice.
+
+        After a dispatch that never completed, the device is drained first: an
+        object referenced by a pending submission cannot legally be destroyed.
+        """
         if self._destroyed:
             return
         self._destroyed = True
         lib, device, handles = self._lib, self._device, self._handles
+        if self._pending:
+            lib.vkDeviceWaitIdle(device)
+            self._pending = False
         lib.vkDestroyFence(device, handles.fence, None)
         # Destroying the pools frees the command buffer and descriptor set.
         lib.vkDestroyCommandPool(device, handles.command_pool, None)

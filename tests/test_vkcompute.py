@@ -386,6 +386,10 @@ class _FakeVulkan:
         self.events.append("wait")
         return self._status("vkWaitForFences")
 
+    def vkDeviceWaitIdle(self, device: Any) -> int:  # noqa: N802
+        self.events.append("device-idle")
+        return 0
+
 
 def _open(lib: _FakeVulkan, **kwargs: Any) -> vc.VulkanContext:
     """Open a context against ``lib`` instead of the system loader."""
@@ -816,6 +820,12 @@ def test_push_constant_size_is_validated(size: object, message: str) -> None:
         vc._require_push_constant_bytes(size)
 
 
+@pytest.mark.parametrize("size", [0, 4, 128])
+def test_push_constant_size_accepts_the_portable_range(size: int) -> None:
+    """No block, one word, and the 128 bytes every implementation has all pass."""
+    assert vc._require_push_constant_bytes(size) == size
+
+
 @pytest.mark.parametrize(
     ("groups", "expected"),
     [(7, (7, 1, 1)), ((3,), (3, 1, 1)), ((3, 2), (3, 2, 1)), ([3, 2, 1], (3, 2, 1))],
@@ -835,12 +845,18 @@ def test_groups_pad_to_three_dimensions(
         ((1, 0), "must be positive integers"),
         ((1.5,), "must be positive integers"),
         (True, "must be positive integers"),
+        ((1, 65536), "exceeds the 65535 per axis"),
     ],
 )
 def test_groups_reject_nonsense(groups: object, message: str) -> None:
-    """An empty, oversized or non-positive workgroup count is an error."""
+    """An empty, non-positive or unportably large workgroup count is an error."""
     with pytest.raises(vc.VulkanError, match=message):
         vc._require_groups(groups)  # type: ignore[arg-type]
+
+
+def test_groups_accept_the_portable_maximum() -> None:
+    """The guaranteed 65535 per axis is allowed, one more is not."""
+    assert vc._require_groups((65535, 65535, 65535)) == (65535, 65535, 65535)
 
 
 # --------------------------------------------------------------------------
@@ -1116,6 +1132,31 @@ def test_dispatch_reports_a_fence_timeout() -> None:
         pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
         with pytest.raises(vc.VulkanError, match=r"after 0.5s\) failed: VK_TIMEOUT"):
             pipeline.dispatch([buf], groups=1, timeout_s=0.5)
+
+
+def test_a_timed_out_pipeline_refuses_further_dispatch() -> None:
+    """The submission is still in flight, so nothing may be re-recorded."""
+    lib = _FakeVulkan(fail={"vkWaitForFences": 2})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match="VK_TIMEOUT"):
+            pipeline.dispatch([buf], groups=1)
+        with pytest.raises(vc.VulkanError, match="earlier dispatch never completed"):
+            pipeline.dispatch([buf], groups=1)
+        assert lib.events.count("reset-command") == 1
+
+
+def test_a_timed_out_pipeline_drains_the_device_before_destroy() -> None:
+    """Objects a pending submission references are only destroyed after idle."""
+    lib = _FakeVulkan(fail={"vkWaitForFences": 2})
+    with _open(lib) as ctx:
+        buf = ctx.allocate(16)
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        with pytest.raises(vc.VulkanError, match="VK_TIMEOUT"):
+            pipeline.dispatch([buf], groups=1)
+        pipeline.destroy()
+    assert lib.events.index("device-idle") < lib.events.index("destroy-command-pool")
 
 
 def test_pipeline_destroy_is_idempotent() -> None:
