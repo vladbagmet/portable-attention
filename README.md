@@ -161,8 +161,50 @@ is the same heap, so no staging copy is needed. Buffers are created with
 The context owns what it creates: closing it frees buffers the caller forgot,
 then destroys the device and the instance. Both the context and its buffers work
 as context managers, and `close()`/`free()` are idempotent. Anything that fails
-raises `VulkanError` naming the entry point and the `VkResult`. No shader runs
-yet — this is the allocation and transfer path the kernel will sit on.
+raises `VulkanError` naming the entry point and the `VkResult`.
+
+### Running a compute shader
+
+`compute_pipeline()` turns a SPIR-V module into something dispatchable. The
+shader's storage buffers occupy bindings `0..n-1` of descriptor set 0, in the
+order they are passed to `dispatch()`:
+
+```python
+import struct
+
+import numpy as np
+
+from portable_attention import VulkanContext
+
+data = np.arange(1000, dtype=np.float32)
+spirv = open("scale.spv", "rb").read()  # glslangValidator -V -S comp ...
+
+with VulkanContext.open() as ctx:
+    src = ctx.allocate(data.nbytes)
+    dst = ctx.allocate(data.nbytes)
+    src.write(data)
+    with ctx.compute_pipeline(spirv, buffer_count=2, push_constant_bytes=8) as pipe:
+        pipe.dispatch(
+            [src, dst],
+            groups=(data.size + 63) // 64,          # workgroups, not invocations
+            push_constants=struct.pack("<If", data.size, 2.0),
+        )
+    print(dst.read(np.float32, data.shape))         # data * 2.0
+```
+
+`groups` is the number of workgroups — divide the problem size by the shader's
+`local_size` yourself, as Vulkan does. Small parameters travel as push
+constants, capped at the 128 bytes every Vulkan implementation guarantees so a
+kernel stays portable. `dispatch()` is synchronous: it submits, waits on a fence
+(`timeout_s` bounds the wait), and inserts a barrier making shader writes
+visible to the host, so a buffer can be read immediately afterwards. The command
+buffer and fence are created once and reused, so dispatching again in a loop
+only re-records.
+
+SPIR-V is checked for word alignment and its magic number before the driver sees
+it, and a module compiled for the opposite byte order is named as such. A
+pipeline is owned by its context like a buffer, and a failure part-way through
+creating one destroys the objects already made.
 
 ### Tile sizing
 

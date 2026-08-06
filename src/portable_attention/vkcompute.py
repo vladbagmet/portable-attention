@@ -1,11 +1,12 @@
-"""Vulkan compute context: logical device, compute queue and host-visible buffers.
+"""Vulkan compute context: device, queue, host-visible buffers and dispatch.
 
 :mod:`portable_attention.vulkan` answers *is there a Vulkan device here?*. This
 module takes the next step the M2 backend needs: it **opens** one of those
-devices and moves bytes through it. It creates a logical device with a single
-compute queue, allocates storage buffers backed by host-visible coherent
-memory, and keeps that memory mapped so numpy arrays can be copied in and out
-without a staging buffer or a command submission.
+devices, moves bytes through it, and runs SPIR-V compute shaders on them. It
+creates a logical device with a single compute queue, allocates storage buffers
+backed by host-visible coherent memory, and keeps that memory mapped so numpy
+arrays can be copied in and out without a staging buffer or a command
+submission.
 
 Everything goes through the system Vulkan loader with :mod:`ctypes`, so the
 package still depends on nothing but numpy. Host-visible storage buffers are
@@ -20,6 +21,10 @@ Typical use::
             buf.write(q)
             same = buf.read(q.dtype, q.shape)
 
+    with VulkanContext.open() as ctx:
+        pipeline = ctx.compute_pipeline(spirv, buffer_count=2)
+        pipeline.dispatch([src, dst], groups=(groups_x,))
+
 Failures raise :class:`VulkanError` rather than returning a sentinel: by the
 time a caller opens a device, detection has already said one is there, so a
 failure here is exceptional. Resources are released in reverse order by
@@ -31,7 +36,7 @@ from __future__ import annotations
 import ctypes
 from collections.abc import Callable, Sequence
 from types import TracebackType
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -51,12 +56,49 @@ __all__ = [
     "VulkanBuffer",
     "VulkanContext",
     "VulkanError",
+    "VulkanPipeline",
 ]
 
 _VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2
 _VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3
+_VK_STRUCTURE_TYPE_SUBMIT_INFO = 4
 _VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
+_VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8
 _VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12
+_VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16
+_VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO = 18
+_VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO = 29
+_VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30
+_VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO = 32
+_VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO = 33
+_VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO = 34
+_VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET = 35
+_VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39
+_VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40
+_VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 42
+_VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46
+
+_VK_TIMEOUT = 2
+_VK_TRUE = 1
+_VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7
+_VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020
+_VK_PIPELINE_BIND_POINT_COMPUTE = 1
+_VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0
+_VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 0x00000002
+_VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800
+_VK_PIPELINE_STAGE_HOST_BIT = 0x00004000
+_VK_ACCESS_SHADER_WRITE_BIT = 0x00000040
+_VK_ACCESS_HOST_READ_BIT = 0x00002000
+_VK_WHOLE_SIZE = 0xFFFFFFFFFFFFFFFF
+
+# First word of a little-endian SPIR-V module; the reverse is the same module
+# with the opposite byte order, which no Vulkan driver accepts.
+_SPIRV_MAGIC = 0x07230203
+_SPIRV_MAGIC_SWAPPED = 0x03022307
+
+# Vulkan guarantees at least this much push-constant space on every
+# implementation, so staying inside it keeps a kernel portable by construction.
+_MIN_MAX_PUSH_CONSTANTS_SIZE = 128
 
 _VK_SHARING_MODE_EXCLUSIVE = 0
 _VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001
@@ -92,6 +134,7 @@ _RESULT_NAMES = {
     -9: "VK_ERROR_INCOMPATIBLE_DRIVER",
     -10: "VK_ERROR_TOO_MANY_OBJECTS",
     -13: "VK_ERROR_UNKNOWN",
+    _VK_TIMEOUT: "VK_TIMEOUT",
 }
 
 
@@ -194,6 +237,226 @@ class _VkMemoryAllocateInfo(ctypes.Structure):
     )
 
 
+class _VkShaderModuleCreateInfo(ctypes.Structure):
+    """``VkShaderModuleCreateInfo`` pointing at a SPIR-V word array."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("codeSize", ctypes.c_size_t),
+        ("pCode", ctypes.c_void_p),
+    )
+
+
+class _VkDescriptorSetLayoutBinding(ctypes.Structure):
+    """``VkDescriptorSetLayoutBinding`` for one storage buffer."""
+
+    _fields_ = (
+        ("binding", ctypes.c_uint32),
+        ("descriptorType", ctypes.c_uint32),
+        ("descriptorCount", ctypes.c_uint32),
+        ("stageFlags", ctypes.c_uint32),
+        ("pImmutableSamplers", ctypes.c_void_p),
+    )
+
+
+class _VkDescriptorSetLayoutCreateInfo(ctypes.Structure):
+    """``VkDescriptorSetLayoutCreateInfo`` over an array of bindings."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("bindingCount", ctypes.c_uint32),
+        ("pBindings", ctypes.c_void_p),
+    )
+
+
+class _VkDescriptorPoolSize(ctypes.Structure):
+    """``VkDescriptorPoolSize``: how many descriptors of one type to reserve."""
+
+    _fields_ = (
+        ("type", ctypes.c_uint32),
+        ("descriptorCount", ctypes.c_uint32),
+    )
+
+
+class _VkDescriptorPoolCreateInfo(ctypes.Structure):
+    """``VkDescriptorPoolCreateInfo`` for a pool holding a single set."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("maxSets", ctypes.c_uint32),
+        ("poolSizeCount", ctypes.c_uint32),
+        ("pPoolSizes", ctypes.c_void_p),
+    )
+
+
+class _VkDescriptorSetAllocateInfo(ctypes.Structure):
+    """``VkDescriptorSetAllocateInfo`` for one set of a known layout."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("descriptorPool", ctypes.c_uint64),
+        ("descriptorSetCount", ctypes.c_uint32),
+        ("pSetLayouts", ctypes.c_void_p),
+    )
+
+
+class _VkDescriptorBufferInfo(ctypes.Structure):
+    """``VkDescriptorBufferInfo`` naming the whole range of one buffer."""
+
+    _fields_ = (
+        ("buffer", ctypes.c_uint64),
+        ("offset", ctypes.c_uint64),
+        ("range", ctypes.c_uint64),
+    )
+
+
+class _VkWriteDescriptorSet(ctypes.Structure):
+    """``VkWriteDescriptorSet`` binding one buffer to one binding number."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("dstSet", ctypes.c_uint64),
+        ("dstBinding", ctypes.c_uint32),
+        ("dstArrayElement", ctypes.c_uint32),
+        ("descriptorCount", ctypes.c_uint32),
+        ("descriptorType", ctypes.c_uint32),
+        ("pImageInfo", ctypes.c_void_p),
+        ("pBufferInfo", ctypes.c_void_p),
+        ("pTexelBufferView", ctypes.c_void_p),
+    )
+
+
+class _VkPushConstantRange(ctypes.Structure):
+    """``VkPushConstantRange`` for the compute stage."""
+
+    _fields_ = (
+        ("stageFlags", ctypes.c_uint32),
+        ("offset", ctypes.c_uint32),
+        ("size", ctypes.c_uint32),
+    )
+
+
+class _VkPipelineLayoutCreateInfo(ctypes.Structure):
+    """``VkPipelineLayoutCreateInfo`` with one set layout and one range."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("setLayoutCount", ctypes.c_uint32),
+        ("pSetLayouts", ctypes.c_void_p),
+        ("pushConstantRangeCount", ctypes.c_uint32),
+        ("pPushConstantRanges", ctypes.c_void_p),
+    )
+
+
+class _VkPipelineShaderStageCreateInfo(ctypes.Structure):
+    """``VkPipelineShaderStageCreateInfo`` for a compute entry point."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("stage", ctypes.c_uint32),
+        ("module", ctypes.c_uint64),
+        ("pName", ctypes.c_char_p),
+        ("pSpecializationInfo", ctypes.c_void_p),
+    )
+
+
+class _VkComputePipelineCreateInfo(ctypes.Structure):
+    """``VkComputePipelineCreateInfo`` (the stage is embedded by value)."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("stage", _VkPipelineShaderStageCreateInfo),
+        ("layout", ctypes.c_uint64),
+        ("basePipelineHandle", ctypes.c_uint64),
+        ("basePipelineIndex", ctypes.c_int32),
+    )
+
+
+class _VkCommandPoolCreateInfo(ctypes.Structure):
+    """``VkCommandPoolCreateInfo`` for the compute queue family."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("queueFamilyIndex", ctypes.c_uint32),
+    )
+
+
+class _VkCommandBufferAllocateInfo(ctypes.Structure):
+    """``VkCommandBufferAllocateInfo`` for one primary command buffer."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("commandPool", ctypes.c_uint64),
+        ("level", ctypes.c_uint32),
+        ("commandBufferCount", ctypes.c_uint32),
+    )
+
+
+class _VkCommandBufferBeginInfo(ctypes.Structure):
+    """``VkCommandBufferBeginInfo`` for a primary command buffer."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("pInheritanceInfo", ctypes.c_void_p),
+    )
+
+
+class _VkMemoryBarrier(ctypes.Structure):
+    """``VkMemoryBarrier`` for a global execution/memory dependency."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("srcAccessMask", ctypes.c_uint32),
+        ("dstAccessMask", ctypes.c_uint32),
+    )
+
+
+class _VkSubmitInfo(ctypes.Structure):
+    """``VkSubmitInfo`` for one command buffer and no semaphores."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("waitSemaphoreCount", ctypes.c_uint32),
+        ("pWaitSemaphores", ctypes.c_void_p),
+        ("pWaitDstStageMask", ctypes.c_void_p),
+        ("commandBufferCount", ctypes.c_uint32),
+        ("pCommandBuffers", ctypes.c_void_p),
+        ("signalSemaphoreCount", ctypes.c_uint32),
+        ("pSignalSemaphores", ctypes.c_void_p),
+    )
+
+
+class _VkFenceCreateInfo(ctypes.Structure):
+    """``VkFenceCreateInfo`` for an unsignalled fence."""
+
+    _fields_ = (
+        ("sType", ctypes.c_uint32),
+        ("pNext", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+    )
+
+
 def _require_positive_int(value: object) -> None:
     """Reject a buffer size that is not a positive integer.
 
@@ -203,6 +466,82 @@ def _require_positive_int(value: object) -> None:
     """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise VulkanError(f"buffer size must be a positive integer, got {value!r}")
+
+
+def _require_spirv(code: object) -> bytes:
+    """Return ``code`` as SPIR-V bytes, rejecting anything a driver would refuse.
+
+    A malformed module is a caller mistake that Vulkan is entitled to answer
+    with undefined behaviour, so the header is checked here: 4-byte words and
+    the little-endian magic number.
+    """
+    if not isinstance(code, (bytes, bytearray, memoryview)):
+        raise VulkanError(f"SPIR-V code must be bytes-like, got {type(code).__name__}")
+    data = bytes(code)
+    if len(data) < 4 or len(data) % 4:
+        raise VulkanError(
+            f"SPIR-V code must be a whole number of 32-bit words, got {len(data)} bytes"
+        )
+    magic = int.from_bytes(data[:4], "little")
+    if magic == _SPIRV_MAGIC_SWAPPED:
+        raise VulkanError("SPIR-V module is byte-swapped; recompile for this host")
+    if magic != _SPIRV_MAGIC:
+        raise VulkanError(
+            f"not a SPIR-V module: first word is 0x{magic:08x}, "
+            f"expected 0x{_SPIRV_MAGIC:08x}"
+        )
+    return data
+
+
+def _is_positive_int(value: object) -> bool:
+    """Return ``True`` for a positive integer that is not a ``bool``.
+
+    Counts here become 32-bit unsigned arguments to Vulkan, so a float would be
+    truncated and ``True`` would silently mean 1.
+    """
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _require_buffer_count(value: object) -> int:
+    """Reject a descriptor count that is not a positive integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise VulkanError(f"buffer_count must be a positive integer, got {value!r}")
+    return value
+
+
+def _require_push_constant_bytes(value: object) -> int:
+    """Validate a push-constant block size against the portable Vulkan floor.
+
+    Vulkan requires push-constant sizes to be a multiple of 4 and guarantees
+    only 128 bytes of space, so a larger block would work on some drivers and
+    fail on others.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise VulkanError(
+            f"push_constant_bytes must be a non-negative integer, got {value!r}"
+        )
+    if value % 4:
+        raise VulkanError(f"push_constant_bytes must be a multiple of 4, got {value}")
+    if value > _MIN_MAX_PUSH_CONSTANTS_SIZE:
+        raise VulkanError(
+            f"push_constant_bytes {value} exceeds the {_MIN_MAX_PUSH_CONSTANTS_SIZE}"
+            " bytes every Vulkan implementation guarantees"
+        )
+    return value
+
+
+def _require_groups(groups: int | Sequence[int]) -> tuple[int, int, int]:
+    """Normalise a workgroup count to a 3-tuple, padding missing axes with 1."""
+    counts = (groups,) if isinstance(groups, int) else tuple(groups)
+    if not 1 <= len(counts) <= 3:
+        raise VulkanError(f"groups needs 1 to 3 dimensions, got {len(counts)}")
+    for count in counts:
+        if not _is_positive_int(count):
+            raise VulkanError(
+                f"workgroup counts must be positive integers, got {counts}"
+            )
+    padded = counts + (1,) * (3 - len(counts))
+    return padded[0], padded[1], padded[2]
 
 
 def _check(status: int, what: str) -> None:
@@ -339,6 +678,17 @@ class VulkanBuffer:
         """``True`` once the buffer and its memory have been released."""
         return self._freed
 
+    @property
+    def handle(self) -> int:
+        """The underlying ``VkBuffer`` handle, for binding into a descriptor set.
+
+        Raises:
+            VulkanError: When the buffer has already been freed.
+        """
+        if self._freed:
+            raise VulkanError("buffer has been freed")
+        return int(self._buffer.value)
+
     def _live_address(self) -> int:
         """Return the mapped address, refusing to touch a freed buffer."""
         if self._freed:
@@ -427,6 +777,281 @@ class VulkanBuffer:
         self.free()
 
 
+class _PipelineHandles(NamedTuple):
+    """Every Vulkan object a dispatchable compute pipeline is made of."""
+
+    shader_module: ctypes.c_uint64
+    descriptor_set_layout: ctypes.c_uint64
+    descriptor_pool: ctypes.c_uint64
+    descriptor_set: ctypes.c_uint64
+    pipeline_layout: ctypes.c_uint64
+    pipeline: ctypes.c_uint64
+    command_pool: ctypes.c_uint64
+    command_buffer: ctypes.c_void_p
+    fence: ctypes.c_uint64
+
+
+class VulkanPipeline:
+    """A compiled SPIR-V compute shader that can be dispatched over buffers.
+
+    Created by :meth:`VulkanContext.compute_pipeline`; not constructed directly.
+    The shader's storage buffers all live in descriptor set 0, bound in the
+    order they are passed to :meth:`dispatch`: ``buffers[i]`` is ``binding = i``.
+    One command buffer and one fence are created up front and reused, so a
+    repeated dispatch records and submits without allocating.
+
+    Dispatch is synchronous: it waits on the fence and inserts a barrier making
+    shader writes visible to the host, so a buffer can be read straight after.
+    Usable as a context manager, and :meth:`destroy` is idempotent.
+    """
+
+    def __init__(
+        self,
+        lib: ctypes.CDLL,
+        device: ctypes.c_void_p,
+        queue: ctypes.c_void_p,
+        handles: _PipelineHandles,
+        *,
+        buffer_count: int,
+        push_constant_bytes: int,
+        release: Callable[[VulkanPipeline], None],
+    ) -> None:
+        self._lib = lib
+        self._device = device
+        self._queue = queue
+        self._handles = handles
+        self._buffer_count = buffer_count
+        self._push_constant_bytes = push_constant_bytes
+        self._release = release
+        self._destroyed = False
+        self._dispatch_count = 0
+
+    @property
+    def buffer_count(self) -> int:
+        """Number of storage buffers the shader expects, one per binding."""
+        return self._buffer_count
+
+    @property
+    def push_constant_bytes(self) -> int:
+        """Size of the push-constant block, in bytes (0 when the shader has none)."""
+        return self._push_constant_bytes
+
+    @property
+    def dispatch_count(self) -> int:
+        """How many dispatches have completed through this pipeline."""
+        return self._dispatch_count
+
+    @property
+    def destroyed(self) -> bool:
+        """``True`` once the pipeline's Vulkan objects have been released."""
+        return self._destroyed
+
+    def dispatch(
+        self,
+        buffers: Sequence[VulkanBuffer],
+        *,
+        groups: int | Sequence[int],
+        push_constants: bytes | None = None,
+        timeout_s: float = 10.0,
+    ) -> None:
+        """Run the shader once and wait for it to finish.
+
+        Args:
+            buffers: One live buffer per binding, in binding order. Exactly
+                :attr:`buffer_count` of them.
+            groups: Workgroup counts, as an int or a 1-to-3 element sequence;
+                missing axes default to 1. This is the number of *workgroups*,
+                not invocations — divide by the shader's ``local_size``.
+            push_constants: Exactly :attr:`push_constant_bytes` of packed data,
+                or ``None`` when the shader declares no push constants.
+            timeout_s: How long to wait for the queue before giving up. A
+                timeout means the device is wedged, so it raises rather than
+                returning quietly with a half-written buffer.
+
+        Raises:
+            VulkanError: When the pipeline was destroyed, the arguments do not
+                match what it was built for, a buffer has been freed, or a
+                Vulkan entry point fails or times out.
+        """
+        if self._destroyed:
+            raise VulkanError("pipeline has been destroyed")
+        if timeout_s <= 0:
+            raise VulkanError(f"timeout_s must be positive, got {timeout_s!r}")
+        bound = tuple(buffers)
+        if len(bound) != self._buffer_count:
+            raise VulkanError(
+                f"pipeline binds {self._buffer_count} buffer(s), got {len(bound)}"
+            )
+        payload = self._push_constant_payload(push_constants)
+        group_counts = _require_groups(groups)
+
+        self._bind(bound)
+        self._record(group_counts, payload)
+        self._submit(timeout_s)
+        self._dispatch_count += 1
+
+    def _push_constant_payload(self, push_constants: bytes | None) -> bytes:
+        """Validate the push-constant block against the pipeline's declared size."""
+        payload = b"" if push_constants is None else bytes(push_constants)
+        if len(payload) != self._push_constant_bytes:
+            raise VulkanError(
+                f"pipeline declares {self._push_constant_bytes} push-constant "
+                f"byte(s), got {len(payload)}"
+            )
+        return payload
+
+    def _bind(self, buffers: Sequence[VulkanBuffer]) -> None:
+        """Point the descriptor set at ``buffers``, one buffer per binding."""
+        infos = (_VkDescriptorBufferInfo * len(buffers))()
+        writes = (_VkWriteDescriptorSet * len(buffers))()
+        for index, buffer in enumerate(buffers):
+            infos[index] = _VkDescriptorBufferInfo(
+                buffer=buffer.handle, offset=0, range=_VK_WHOLE_SIZE
+            )
+            writes[index] = _VkWriteDescriptorSet(
+                sType=_VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=self._handles.descriptor_set,
+                dstBinding=index,
+                dstArrayElement=0,
+                descriptorCount=1,
+                descriptorType=_VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=ctypes.cast(
+                    ctypes.byref(infos, ctypes.sizeof(_VkDescriptorBufferInfo) * index),
+                    ctypes.c_void_p,
+                ),
+            )
+        self._lib.vkUpdateDescriptorSets(
+            self._device,
+            ctypes.c_uint32(len(buffers)),
+            writes,
+            ctypes.c_uint32(0),
+            None,
+        )
+
+    def _record(self, groups: tuple[int, int, int], push_constants: bytes) -> None:
+        """Re-record the command buffer for one dispatch of ``groups``."""
+        lib = self._lib
+        command_buffer = self._handles.command_buffer
+        _check(
+            lib.vkResetCommandBuffer(command_buffer, ctypes.c_uint32(0)),
+            "vkResetCommandBuffer",
+        )
+        begin = _VkCommandBufferBeginInfo(
+            sType=_VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+        )
+        _check(
+            lib.vkBeginCommandBuffer(command_buffer, ctypes.pointer(begin)),
+            "vkBeginCommandBuffer",
+        )
+        lib.vkCmdBindPipeline(
+            command_buffer,
+            ctypes.c_uint32(_VK_PIPELINE_BIND_POINT_COMPUTE),
+            self._handles.pipeline,
+        )
+        descriptor_sets = (ctypes.c_uint64 * 1)(self._handles.descriptor_set)
+        lib.vkCmdBindDescriptorSets(
+            command_buffer,
+            ctypes.c_uint32(_VK_PIPELINE_BIND_POINT_COMPUTE),
+            self._handles.pipeline_layout,
+            ctypes.c_uint32(0),
+            ctypes.c_uint32(1),
+            descriptor_sets,
+            ctypes.c_uint32(0),
+            None,
+        )
+        if push_constants:
+            lib.vkCmdPushConstants(
+                command_buffer,
+                self._handles.pipeline_layout,
+                ctypes.c_uint32(_VK_SHADER_STAGE_COMPUTE_BIT),
+                ctypes.c_uint32(0),
+                ctypes.c_uint32(len(push_constants)),
+                ctypes.create_string_buffer(push_constants, len(push_constants)),
+            )
+        lib.vkCmdDispatch(command_buffer, *(ctypes.c_uint32(count) for count in groups))
+        # Shader writes are not host-visible just because the memory is
+        # coherent: the dependency has to be spelled out before the host reads.
+        barrier = _VkMemoryBarrier(
+            sType=_VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            srcAccessMask=_VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask=_VK_ACCESS_HOST_READ_BIT,
+        )
+        lib.vkCmdPipelineBarrier(
+            command_buffer,
+            ctypes.c_uint32(_VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+            ctypes.c_uint32(_VK_PIPELINE_STAGE_HOST_BIT),
+            ctypes.c_uint32(0),
+            ctypes.c_uint32(1),
+            ctypes.pointer(barrier),
+            ctypes.c_uint32(0),
+            None,
+            ctypes.c_uint32(0),
+            None,
+        )
+        _check(lib.vkEndCommandBuffer(command_buffer), "vkEndCommandBuffer")
+
+    def _submit(self, timeout_s: float) -> None:
+        """Submit the recorded command buffer and block on its fence."""
+        lib = self._lib
+        fences = (ctypes.c_uint64 * 1)(self._handles.fence)
+        _check(
+            lib.vkResetFences(self._device, ctypes.c_uint32(1), fences),
+            "vkResetFences",
+        )
+        command_buffers = (ctypes.c_void_p * 1)(self._handles.command_buffer)
+        submit = _VkSubmitInfo(
+            sType=_VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount=1,
+            pCommandBuffers=ctypes.cast(command_buffers, ctypes.c_void_p),
+        )
+        _check(
+            lib.vkQueueSubmit(
+                self._queue,
+                ctypes.c_uint32(1),
+                ctypes.pointer(submit),
+                self._handles.fence,
+            ),
+            "vkQueueSubmit",
+        )
+        _check(
+            lib.vkWaitForFences(
+                self._device,
+                ctypes.c_uint32(1),
+                fences,
+                ctypes.c_uint32(_VK_TRUE),
+                ctypes.c_uint64(int(timeout_s * 1e9)),
+            ),
+            f"vkWaitForFences (after {timeout_s}s)",
+        )
+
+    def destroy(self) -> None:
+        """Release every Vulkan object of the pipeline. Safe to call twice."""
+        if self._destroyed:
+            return
+        self._destroyed = True
+        lib, device, handles = self._lib, self._device, self._handles
+        lib.vkDestroyFence(device, handles.fence, None)
+        # Destroying the pools frees the command buffer and descriptor set.
+        lib.vkDestroyCommandPool(device, handles.command_pool, None)
+        lib.vkDestroyPipeline(device, handles.pipeline, None)
+        lib.vkDestroyPipelineLayout(device, handles.pipeline_layout, None)
+        lib.vkDestroyDescriptorPool(device, handles.descriptor_pool, None)
+        lib.vkDestroyDescriptorSetLayout(device, handles.descriptor_set_layout, None)
+        lib.vkDestroyShaderModule(device, handles.shader_module, None)
+        self._release(self)
+
+    def __enter__(self) -> VulkanPipeline:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.destroy()
+
+
 class VulkanContext:
     """An open Vulkan device with one compute queue.
 
@@ -457,6 +1082,7 @@ class VulkanContext:
         self._api_version = api_version
         self._queue_family_index = queue_family_index
         self._buffers: list[VulkanBuffer] = []
+        self._pipelines: list[VulkanPipeline] = []
         self._closed = False
 
     @classmethod
@@ -531,6 +1157,67 @@ class VulkanContext:
     def live_buffers(self) -> int:
         """Number of buffers allocated through this context and not yet freed."""
         return len(self._buffers)
+
+    @property
+    def live_pipelines(self) -> int:
+        """Number of pipelines built through this context and not yet destroyed."""
+        return len(self._pipelines)
+
+    def compute_pipeline(
+        self,
+        spirv: bytes,
+        *,
+        buffer_count: int,
+        push_constant_bytes: int = 0,
+        entry_point: str = "main",
+    ) -> VulkanPipeline:
+        """Compile a SPIR-V compute shader into a dispatchable pipeline.
+
+        Args:
+            spirv: The compiled module, as produced by e.g. ``glslangValidator
+                -V``. Bytes-like, a whole number of 32-bit words, starting with
+                the SPIR-V magic number.
+            buffer_count: How many storage buffers the shader reads or writes.
+                They occupy bindings ``0..buffer_count - 1`` of descriptor set 0.
+            push_constant_bytes: Size of the shader's push-constant block; 0
+                when it has none. Must be a multiple of 4 and no larger than the
+                128 bytes Vulkan guarantees everywhere.
+            entry_point: Name of the shader's entry point.
+
+        Returns:
+            A :class:`VulkanPipeline` owned by this context.
+
+        Raises:
+            VulkanError: When the context is closed, an argument is invalid, or
+                a Vulkan entry point fails. Objects created before a failure are
+                destroyed, so a rejected pipeline leaks nothing.
+        """
+        if self._closed:
+            raise VulkanError("context is closed")
+        code = _require_spirv(spirv)
+        bindings = _require_buffer_count(buffer_count)
+        push_bytes = _require_push_constant_bytes(push_constant_bytes)
+
+        handles = _build_pipeline(
+            self._lib,
+            self._device,
+            queue_family_index=self._queue_family_index,
+            code=code,
+            buffer_count=bindings,
+            push_constant_bytes=push_bytes,
+            entry_point=entry_point,
+        )
+        pipeline = VulkanPipeline(
+            self._lib,
+            self._device,
+            self._queue,
+            handles,
+            buffer_count=bindings,
+            push_constant_bytes=push_bytes,
+            release=self._forget_pipeline,
+        )
+        self._pipelines.append(pipeline)
+        return pipeline
 
     def allocate(self, nbytes: int) -> VulkanBuffer:
         """Allocate a host-visible storage buffer of ``nbytes`` bytes.
@@ -639,14 +1326,20 @@ class VulkanContext:
         """Drop a freed buffer from the live set (called by its ``free``)."""
         self._buffers.remove(buffer)
 
-    def close(self) -> None:
-        """Free outstanding buffers and destroy the device and instance.
+    def _forget_pipeline(self, pipeline: VulkanPipeline) -> None:
+        """Drop a destroyed pipeline from the live set (called by ``destroy``)."""
+        self._pipelines.remove(pipeline)
 
-        Idempotent. Buffers allocated through this context are freed first, so
+    def close(self) -> None:
+        """Destroy outstanding pipelines and buffers, then the device and instance.
+
+        Idempotent. Objects created through this context are released first, so
         forgetting one is a leak the context still cleans up.
         """
         if self._closed:
             return
+        for pipeline in list(self._pipelines):
+            pipeline.destroy()
         for buffer in list(self._buffers):
             buffer.free()
         self._closed = True
@@ -663,6 +1356,280 @@ class VulkanContext:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def _build_pipeline(
+    lib: ctypes.CDLL,
+    device: ctypes.c_void_p,
+    *,
+    queue_family_index: int,
+    code: bytes,
+    buffer_count: int,
+    push_constant_bytes: int,
+    entry_point: str,
+) -> _PipelineHandles:
+    """Create every object a compute dispatch needs, rolling back on failure.
+
+    The nine handles are created in dependency order; each one registers how to
+    undo itself, so a failure anywhere destroys exactly what already exists and
+    nothing else.
+    """
+    undo: list[Callable[[], None]] = []
+    try:
+        shader_module = _create_shader_module(lib, device, code)
+        undo.append(lambda: lib.vkDestroyShaderModule(device, shader_module, None))
+
+        set_layout = _create_descriptor_set_layout(lib, device, buffer_count)
+        undo.append(lambda: lib.vkDestroyDescriptorSetLayout(device, set_layout, None))
+
+        pool = _create_descriptor_pool(lib, device, buffer_count)
+        undo.append(lambda: lib.vkDestroyDescriptorPool(device, pool, None))
+
+        descriptor_set = _allocate_descriptor_set(lib, device, pool, set_layout)
+
+        pipeline_layout = _create_pipeline_layout(
+            lib, device, set_layout, push_constant_bytes
+        )
+        undo.append(lambda: lib.vkDestroyPipelineLayout(device, pipeline_layout, None))
+
+        pipeline = _create_pipeline(
+            lib, device, shader_module, pipeline_layout, entry_point
+        )
+        undo.append(lambda: lib.vkDestroyPipeline(device, pipeline, None))
+
+        command_pool = _create_command_pool(lib, device, queue_family_index)
+        undo.append(lambda: lib.vkDestroyCommandPool(device, command_pool, None))
+
+        command_buffer = _allocate_command_buffer(lib, device, command_pool)
+        fence = _create_fence(lib, device)
+    except BaseException:
+        for step in reversed(undo):
+            step()
+        raise
+    return _PipelineHandles(
+        shader_module=shader_module,
+        descriptor_set_layout=set_layout,
+        descriptor_pool=pool,
+        descriptor_set=descriptor_set,
+        pipeline_layout=pipeline_layout,
+        pipeline=pipeline,
+        command_pool=command_pool,
+        command_buffer=command_buffer,
+        fence=fence,
+    )
+
+
+def _create_shader_module(
+    lib: ctypes.CDLL, device: ctypes.c_void_p, code: bytes
+) -> ctypes.c_uint64:
+    """Hand a validated SPIR-V module to the driver."""
+    words = (ctypes.c_uint32 * (len(code) // 4)).from_buffer_copy(code)
+    info = _VkShaderModuleCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        codeSize=len(code),
+        pCode=ctypes.cast(words, ctypes.c_void_p),
+    )
+    module = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreateShaderModule(
+            device, ctypes.pointer(info), None, ctypes.pointer(module)
+        ),
+        "vkCreateShaderModule",
+    )
+    return module
+
+
+def _create_descriptor_set_layout(
+    lib: ctypes.CDLL, device: ctypes.c_void_p, buffer_count: int
+) -> ctypes.c_uint64:
+    """Describe ``buffer_count`` storage buffers at bindings 0..n-1 of set 0."""
+    bindings = (_VkDescriptorSetLayoutBinding * buffer_count)(
+        *(
+            _VkDescriptorSetLayoutBinding(
+                binding=index,
+                descriptorType=_VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=_VK_SHADER_STAGE_COMPUTE_BIT,
+            )
+            for index in range(buffer_count)
+        )
+    )
+    info = _VkDescriptorSetLayoutCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        bindingCount=buffer_count,
+        pBindings=ctypes.cast(bindings, ctypes.c_void_p),
+    )
+    layout = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreateDescriptorSetLayout(
+            device, ctypes.pointer(info), None, ctypes.pointer(layout)
+        ),
+        "vkCreateDescriptorSetLayout",
+    )
+    return layout
+
+
+def _create_descriptor_pool(
+    lib: ctypes.CDLL, device: ctypes.c_void_p, buffer_count: int
+) -> ctypes.c_uint64:
+    """Reserve one descriptor set holding ``buffer_count`` storage buffers."""
+    sizes = (_VkDescriptorPoolSize * 1)(
+        _VkDescriptorPoolSize(
+            type=_VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount=buffer_count
+        )
+    )
+    info = _VkDescriptorPoolCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        maxSets=1,
+        poolSizeCount=1,
+        pPoolSizes=ctypes.cast(sizes, ctypes.c_void_p),
+    )
+    pool = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreateDescriptorPool(
+            device, ctypes.pointer(info), None, ctypes.pointer(pool)
+        ),
+        "vkCreateDescriptorPool",
+    )
+    return pool
+
+
+def _allocate_descriptor_set(
+    lib: ctypes.CDLL,
+    device: ctypes.c_void_p,
+    pool: ctypes.c_uint64,
+    set_layout: ctypes.c_uint64,
+) -> ctypes.c_uint64:
+    """Allocate the single descriptor set; the pool owns it until destroyed."""
+    layouts = (ctypes.c_uint64 * 1)(set_layout)
+    info = _VkDescriptorSetAllocateInfo(
+        sType=_VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptorPool=pool,
+        descriptorSetCount=1,
+        pSetLayouts=ctypes.cast(layouts, ctypes.c_void_p),
+    )
+    sets = (ctypes.c_uint64 * 1)(0)
+    _check(
+        lib.vkAllocateDescriptorSets(device, ctypes.pointer(info), sets),
+        "vkAllocateDescriptorSets",
+    )
+    return ctypes.c_uint64(sets[0])
+
+
+def _create_pipeline_layout(
+    lib: ctypes.CDLL,
+    device: ctypes.c_void_p,
+    set_layout: ctypes.c_uint64,
+    push_constant_bytes: int,
+) -> ctypes.c_uint64:
+    """Combine the descriptor set layout with the push-constant range."""
+    layouts = (ctypes.c_uint64 * 1)(set_layout)
+    ranges = (_VkPushConstantRange * 1)(
+        _VkPushConstantRange(
+            stageFlags=_VK_SHADER_STAGE_COMPUTE_BIT,
+            offset=0,
+            size=push_constant_bytes,
+        )
+    )
+    info = _VkPipelineLayoutCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        setLayoutCount=1,
+        pSetLayouts=ctypes.cast(layouts, ctypes.c_void_p),
+        pushConstantRangeCount=1 if push_constant_bytes else 0,
+        pPushConstantRanges=(
+            ctypes.cast(ranges, ctypes.c_void_p) if push_constant_bytes else None
+        ),
+    )
+    layout = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreatePipelineLayout(
+            device, ctypes.pointer(info), None, ctypes.pointer(layout)
+        ),
+        "vkCreatePipelineLayout",
+    )
+    return layout
+
+
+def _create_pipeline(
+    lib: ctypes.CDLL,
+    device: ctypes.c_void_p,
+    shader_module: ctypes.c_uint64,
+    pipeline_layout: ctypes.c_uint64,
+    entry_point: str,
+) -> ctypes.c_uint64:
+    """Compile the shader for the device against ``pipeline_layout``."""
+    name = entry_point.encode("utf-8")
+    info = _VkComputePipelineCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        stage=_VkPipelineShaderStageCreateInfo(
+            sType=_VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage=_VK_SHADER_STAGE_COMPUTE_BIT,
+            module=shader_module,
+            pName=name,
+        ),
+        layout=pipeline_layout,
+    )
+    pipeline = (ctypes.c_uint64 * 1)(0)
+    _check(
+        lib.vkCreateComputePipelines(
+            device,
+            ctypes.c_uint64(0),
+            ctypes.c_uint32(1),
+            ctypes.pointer(info),
+            None,
+            pipeline,
+        ),
+        "vkCreateComputePipelines",
+    )
+    return ctypes.c_uint64(pipeline[0])
+
+
+def _create_command_pool(
+    lib: ctypes.CDLL, device: ctypes.c_void_p, queue_family_index: int
+) -> ctypes.c_uint64:
+    """Create a command pool whose buffers can be reset and re-recorded."""
+    info = _VkCommandPoolCreateInfo(
+        sType=_VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        flags=_VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        queueFamilyIndex=queue_family_index,
+    )
+    pool = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreateCommandPool(
+            device, ctypes.pointer(info), None, ctypes.pointer(pool)
+        ),
+        "vkCreateCommandPool",
+    )
+    return pool
+
+
+def _allocate_command_buffer(
+    lib: ctypes.CDLL, device: ctypes.c_void_p, command_pool: ctypes.c_uint64
+) -> ctypes.c_void_p:
+    """Allocate the one primary command buffer every dispatch re-records."""
+    info = _VkCommandBufferAllocateInfo(
+        sType=_VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        commandPool=command_pool,
+        level=_VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        commandBufferCount=1,
+    )
+    buffers = (ctypes.c_void_p * 1)(None)
+    _check(
+        lib.vkAllocateCommandBuffers(device, ctypes.pointer(info), buffers),
+        "vkAllocateCommandBuffers",
+    )
+    return ctypes.c_void_p(buffers[0])
+
+
+def _create_fence(lib: ctypes.CDLL, device: ctypes.c_void_p) -> ctypes.c_uint64:
+    """Create the unsignalled fence each dispatch waits on."""
+    info = _VkFenceCreateInfo(sType=_VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+    fence = ctypes.c_uint64(0)
+    _check(
+        lib.vkCreateFence(device, ctypes.pointer(info), None, ctypes.pointer(fence)),
+        "vkCreateFence",
+    )
+    return fence
 
 
 def _create_instance(lib: ctypes.CDLL) -> ctypes.c_void_p:

@@ -1,0 +1,30 @@
+#version 450
+//
+// Acceptance kernel for the Vulkan dispatch path: out[i] = in[i] * scale.
+//
+// Compiled to double.spv, which is committed next to this file so the test
+// suite can dispatch it on hosts without a shader compiler:
+//
+//   glslangValidator -V --target-env vulkan1.0 -S comp -o double.spv double.comp
+//
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Source {
+    float value[];
+} src;
+
+layout(std430, set = 0, binding = 1) writeonly buffer Destination {
+    float value[];
+} dst;
+
+layout(push_constant) uniform Params {
+    uint count;
+    float scale;
+} params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < params.count) {
+        dst.value[index] = src.value[index] * params.scale;
+    }
+}
