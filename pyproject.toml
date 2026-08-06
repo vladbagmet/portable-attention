@@ -30,7 +30,11 @@ Repository = "https://github.com/vladbagmet/portable-attention"
 metal = ["pyobjc-framework-Metal>=10; sys_platform == 'darwin'"]
 dev = [
     "pytest>=7",
-    "ruff>=0.5",
+    # Pinned exactly: ruff's formatter changes what it touches between minor
+    # releases (0.16 started formatting Python inside markdown fences), so a
+    # floating range makes `ruff format --check` pass locally and fail in CI.
+    # Bump this deliberately, with the reformat in the same commit.
+    "ruff==0.16.1",
     "pyright>=1.1.350",
     "bandit>=1.7",
     "pip-audit>=2.7",

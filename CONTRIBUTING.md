@@ -34,6 +34,13 @@ It runs, in order: `ruff check` (lint), `ruff format --check` (formatting),
 vulnerabilities), and `coverage run -m pytest` + `coverage report` (tests with
 a coverage floor). Every step must pass; do not weaken a check to get green.
 
+`ruff` is pinned to an exact version in the `dev` extra. Its formatter picks up
+new constructs across minor releases, and a floating range means the version in
+your environment and the one CI resolves can disagree about the same file. If
+you update the pin, run `ruff format .` and commit the result together with the
+bump. Re-run `uv pip install -e ".[dev]"` after pulling a change to the pin so
+your venv follows.
+
 ## Verifying the Metal backend
 
 No CI runner the project controls has an Apple GPU, so Metal changes cannot be
