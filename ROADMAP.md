@@ -47,7 +47,9 @@ reproducible benchmark harness.
 - **Device open + host transfer** — a logical device with a compute queue and
   mapped storage buffers arrays travel through. *(done: `VulkanContext`)*
 - **Shader dispatch** — compile a SPIR-V module, bind storage buffers and push
-  constants, submit and wait. *(done: `VulkanPipeline`)*
+  constants, submit and wait. Specialization constants fix a kernel's workgroup
+  size and tile shape when the pipeline is built, so one committed SPIR-V file
+  serves every tile plan. *(done: `VulkanPipeline`)*
 - **Backend registration** gated on a compute-capable device, driving a minimal
   SPIR-V attention kernel, validated against the reference oracle through the
   conformance kit.

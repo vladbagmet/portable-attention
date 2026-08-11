@@ -34,9 +34,10 @@ failure here is exceptional. Resources are released in reverse order by
 from __future__ import annotations
 
 import ctypes
-from collections.abc import Callable, Sequence
+import struct
+from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Union, cast
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -103,6 +104,16 @@ _MIN_MAX_PUSH_CONSTANTS_SIZE = 128
 # also well inside the 32-bit range vkCmdDispatch takes, so a count that passes
 # cannot wrap on the way to the driver.
 _MIN_MAX_WORKGROUP_COUNT = 65535
+
+# Specialization constants are 32-bit scalars, so ids and integer values are
+# bounded by what a uint32 (or an int32, for negatives) can hold.
+_MAX_UINT32 = 0xFFFFFFFF
+_INT32_MIN_MAGNITUDE = 0x80000000
+_SPECIALIZATION_VALUE_BYTES = 4
+
+# What one ``layout(constant_id = N)`` slot may hold. ``bool`` is an ``int``
+# subclass, so it is listed for the reader rather than for the type checker.
+SpecializationValue = Union[bool, int, float]
 
 _VK_SHARING_MODE_EXCLUSIVE = 0
 _VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001
@@ -338,6 +349,27 @@ class _VkWriteDescriptorSet(ctypes.Structure):
     )
 
 
+class _VkSpecializationMapEntry(ctypes.Structure):
+    """``VkSpecializationMapEntry``: one constant's id, offset and size."""
+
+    _fields_ = (
+        ("constantID", ctypes.c_uint32),
+        ("offset", ctypes.c_uint32),
+        ("size", ctypes.c_size_t),
+    )
+
+
+class _VkSpecializationInfo(ctypes.Structure):
+    """``VkSpecializationInfo``: the map entries plus their packed data blob."""
+
+    _fields_ = (
+        ("mapEntryCount", ctypes.c_uint32),
+        ("pMapEntries", ctypes.c_void_p),
+        ("dataSize", ctypes.c_size_t),
+        ("pData", ctypes.c_void_p),
+    )
+
+
 class _VkPushConstantRange(ctypes.Structure):
     """``VkPushConstantRange`` for the compute stage."""
 
@@ -532,6 +564,101 @@ def _require_push_constant_bytes(value: object) -> int:
             " bytes every Vulkan implementation guarantees"
         )
     return value
+
+
+def _require_specialization(specialization: object) -> dict[int, SpecializationValue]:
+    """Validate a specialization mapping and order it by constant id.
+
+    Constant ids are the ``layout(constant_id = N)`` numbers in the shader.
+    Values must be ``bool``, ``int`` or ``float``: each occupies one 4-byte
+    slot, matching the ``bool``/``int``/``uint``/``float`` scalar constants
+    GLSL can specialize. An id the shader does not declare is ignored by the
+    driver, so this cannot check ids against the module.
+    """
+    if specialization is None:
+        return {}
+    if not isinstance(specialization, Mapping):
+        raise VulkanError(
+            "specialization must be a mapping of constant id to value, got "
+            f"{type(specialization).__name__}"
+        )
+    items = cast("Mapping[object, object]", specialization)
+    entries: dict[int, SpecializationValue] = {}
+    for raw_id, value in items.items():
+        constant_id = _require_constant_id(raw_id)
+        entries[constant_id] = _require_specialization_value(constant_id, value)
+    return {constant_id: entries[constant_id] for constant_id in sorted(entries)}
+
+
+def _require_constant_id(value: object) -> int:
+    """Reject a constant id that is not a uint32."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise VulkanError(
+            f"specialization constant id must be an integer, got {value!r}"
+        )
+    if not 0 <= value <= _MAX_UINT32:
+        raise VulkanError(
+            f"specialization constant id must fit in a uint32, got {value}"
+        )
+    return value
+
+
+def _require_specialization_value(
+    constant_id: int, value: object
+) -> SpecializationValue:
+    """Reject a specialization value that has no 4-byte scalar encoding."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if not -_INT32_MIN_MAGNITUDE <= value <= _MAX_UINT32:
+            raise VulkanError(
+                f"specialization constant {constant_id} value {value} does not "
+                "fit in a 32-bit int"
+            )
+        return value
+    if isinstance(value, float):
+        return _to_binary32(constant_id, value)
+    raise VulkanError(
+        f"specialization constant {constant_id} must be a bool, int or float, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _to_binary32(constant_id: int, value: float) -> float:
+    """Round a Python float to the binary32 the shader will actually see.
+
+    Python floats are binary64; the slot is binary32. Storing the rounded value
+    keeps :attr:`VulkanPipeline.specialization` honest about what was compiled
+    in, and a magnitude with no binary32 at all is rejected here rather than
+    escaping as a raw ``OverflowError`` from the packing step.
+    """
+    try:
+        rounded: float = struct.unpack("=f", struct.pack("=f", value))[0]
+    except OverflowError:
+        raise VulkanError(
+            f"specialization constant {constant_id} value {value} is outside "
+            "the range of a 32-bit float"
+        ) from None
+    return rounded
+
+
+def _pack_specialization_value(value: SpecializationValue) -> bytes:
+    """Encode one constant into its 4-byte SPIR-V representation.
+
+    ``bool`` comes first: it is an ``int`` subclass, and a specialized GLSL
+    ``bool`` is a 32-bit 0/1. Non-negative ints pack as ``uint32`` and negative
+    ones as ``int32``; both fill the same slot, and the shader's declared type
+    decides how the bits are read.
+
+    The formats are native-endian (``=``): Vulkan reads specialization data as
+    the host's own representation of the constant, not as a byte stream with a
+    fixed order.
+    """
+    if isinstance(value, bool):
+        return struct.pack("=I", 1 if value else 0)
+    if isinstance(value, int):
+        return struct.pack("=i" if value < 0 else "=I", value)
+    return struct.pack("=f", value)
 
 
 def _require_groups(groups: int | Sequence[int]) -> tuple[int, int, int]:
@@ -809,6 +936,10 @@ class VulkanPipeline:
     One command buffer and one fence are created up front and reused, so a
     repeated dispatch records and submits without allocating.
 
+    Values the shader needs at compile time (workgroup size, tile shape, the
+    length of a shared array) are fixed here as specialization constants; see
+    :attr:`specialization`.
+
     Dispatch is synchronous: it waits on the fence and inserts a barrier making
     shader writes visible to the host, so a buffer can be read straight after.
     Usable as a context manager, and :meth:`destroy` is idempotent.
@@ -824,6 +955,7 @@ class VulkanPipeline:
         buffer_count: int,
         push_constant_bytes: int,
         release: Callable[[VulkanPipeline], None],
+        specialization: Mapping[int, SpecializationValue] | None = None,
     ) -> None:
         self._lib = lib
         self._device = device
@@ -831,6 +963,7 @@ class VulkanPipeline:
         self._handles = handles
         self._buffer_count = buffer_count
         self._push_constant_bytes = push_constant_bytes
+        self._specialization = dict(specialization or {})
         self._release = release
         self._destroyed = False
         self._pending = False
@@ -845,6 +978,15 @@ class VulkanPipeline:
     def push_constant_bytes(self) -> int:
         """Size of the push-constant block, in bytes (0 when the shader has none)."""
         return self._push_constant_bytes
+
+    @property
+    def specialization(self) -> dict[int, SpecializationValue]:
+        """The specialization constants baked into this pipeline, by id.
+
+        A copy: the values were consumed when the driver compiled the module
+        and cannot be changed afterwards.
+        """
+        return dict(self._specialization)
 
     @property
     def dispatch_count(self) -> int:
@@ -1194,6 +1336,7 @@ class VulkanContext:
         buffer_count: int,
         push_constant_bytes: int = 0,
         entry_point: str = "main",
+        specialization: Mapping[int, SpecializationValue] | None = None,
     ) -> VulkanPipeline:
         """Compile a SPIR-V compute shader into a dispatchable pipeline.
 
@@ -1207,6 +1350,12 @@ class VulkanContext:
                 when it has none. Must be a multiple of 4 and no larger than the
                 128 bytes Vulkan guarantees everywhere.
             entry_point: Name of the shader's entry point.
+            specialization: Values for the shader's ``layout(constant_id = N)``
+                constants, keyed by id. Each must be a ``bool``, ``int`` or
+                ``float`` and is baked in when the driver compiles the module,
+                so one SPIR-V file can be built for several tile shapes or
+                workgroup sizes. Ids the shader does not declare are ignored by
+                the driver; ids it declares and this omits keep their default.
 
         Returns:
             A :class:`VulkanPipeline` owned by this context.
@@ -1221,6 +1370,7 @@ class VulkanContext:
         code = _require_spirv(spirv)
         bindings = _require_buffer_count(buffer_count)
         push_bytes = _require_push_constant_bytes(push_constant_bytes)
+        constants = _require_specialization(specialization)
 
         handles = _build_pipeline(
             self._lib,
@@ -1230,6 +1380,7 @@ class VulkanContext:
             buffer_count=bindings,
             push_constant_bytes=push_bytes,
             entry_point=entry_point,
+            specialization=constants,
         )
         pipeline = VulkanPipeline(
             self._lib,
@@ -1238,6 +1389,7 @@ class VulkanContext:
             handles,
             buffer_count=bindings,
             push_constant_bytes=push_bytes,
+            specialization=constants,
             release=self._forget_pipeline,
         )
         self._pipelines.append(pipeline)
@@ -1391,6 +1543,7 @@ def _build_pipeline(
     buffer_count: int,
     push_constant_bytes: int,
     entry_point: str,
+    specialization: Mapping[int, SpecializationValue],
 ) -> _PipelineHandles:
     """Create every object a compute dispatch needs, rolling back on failure.
 
@@ -1417,7 +1570,12 @@ def _build_pipeline(
         undo.append(lambda: lib.vkDestroyPipelineLayout(device, pipeline_layout, None))
 
         pipeline = _create_pipeline(
-            lib, device, shader_module, pipeline_layout, entry_point
+            lib,
+            device,
+            shader_module,
+            pipeline_layout,
+            entry_point,
+            specialization,
         )
         undo.append(lambda: lib.vkDestroyPipeline(device, pipeline, None))
 
@@ -1574,15 +1732,55 @@ def _create_pipeline_layout(
     return layout
 
 
+def _specialization_arrays(
+    specialization: Mapping[int, SpecializationValue],
+) -> tuple[ctypes.Array[_VkSpecializationMapEntry], ctypes.Array[ctypes.c_char]]:
+    """Lay the constants out as a map-entry table plus one packed data blob.
+
+    Every value takes a 4-byte slot, so entry ``i`` sits at offset ``4 * i`` and
+    the blob is as long as the table. Ids are already ordered by
+    :func:`_require_specialization`, which keeps the layout reproducible.
+    """
+    count = len(specialization)
+    entries = (_VkSpecializationMapEntry * count)()
+    blob = b""
+    for index, (constant_id, value) in enumerate(specialization.items()):
+        entries[index] = _VkSpecializationMapEntry(
+            constantID=constant_id,
+            offset=index * _SPECIALIZATION_VALUE_BYTES,
+            size=_SPECIALIZATION_VALUE_BYTES,
+        )
+        blob += _pack_specialization_value(value)
+    return entries, (ctypes.c_char * len(blob)).from_buffer_copy(blob)
+
+
 def _create_pipeline(
     lib: ctypes.CDLL,
     device: ctypes.c_void_p,
     shader_module: ctypes.c_uint64,
     pipeline_layout: ctypes.c_uint64,
     entry_point: str,
+    specialization: Mapping[int, SpecializationValue],
 ) -> ctypes.c_uint64:
-    """Compile the shader for the device against ``pipeline_layout``."""
+    """Compile the shader for the device against ``pipeline_layout``.
+
+    Specialization constants are resolved here, at pipeline build time: the
+    driver compiles the module with those values baked in, which is what lets a
+    shader size a shared array or its workgroup from them.
+    """
     name = entry_point.encode("utf-8")
+    # entries/blob/spec must outlive the create call: the driver reads them
+    # through the pointers below while it compiles.
+    entries, blob = _specialization_arrays(specialization)
+    spec_pointer: ctypes.c_void_p | None = None
+    if specialization:
+        spec = _VkSpecializationInfo(
+            mapEntryCount=len(specialization),
+            pMapEntries=ctypes.cast(entries, ctypes.c_void_p),
+            dataSize=len(blob),
+            pData=ctypes.cast(blob, ctypes.c_void_p),
+        )
+        spec_pointer = ctypes.cast(ctypes.byref(spec), ctypes.c_void_p)
     info = _VkComputePipelineCreateInfo(
         sType=_VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         stage=_VkPipelineShaderStageCreateInfo(
@@ -1590,6 +1788,7 @@ def _create_pipeline(
             stage=_VK_SHADER_STAGE_COMPUTE_BIT,
             module=shader_module,
             pName=name,
+            pSpecializationInfo=spec_pointer,
         ),
         layout=pipeline_layout,
     )
