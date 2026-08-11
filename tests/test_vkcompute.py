@@ -24,6 +24,12 @@ _QUEUE = 0x0EE0
 _DOUBLE_SPV = Path(__file__).parent / "shaders" / "double.spv"
 _DOUBLE_LOCAL_SIZE = 64
 
+# dst[i] = NEGATE ? -(src[i] * FACTOR + OFFSET) : ..., compiled from
+# tests/shaders/specialized.comp. Workgroup size (id 0) and the three constants
+# (ids 1-3) are all specialization constants; the defaults are a local size of
+# 1, OFFSET 0, FACTOR 1.0 and NEGATE false, i.e. a plain copy.
+_SPECIALIZED_SPV = Path(__file__).parent / "shaders" / "specialized.spv"
+
 _COMPUTE_QUEUE = 0x2
 _GRAPHICS_QUEUE = 0x1
 _HOST_COHERENT = 0x2 | 0x4
@@ -65,6 +71,7 @@ class _FakeVulkan:
         self.events: list[str] = []
         self.descriptors: list[tuple[int, int]] = []
         self.push_constants = b""
+        self.specialization: list[tuple[int, bytes]] = []
         self._next_handle = 1
 
     def _status(self, name: str) -> int:
@@ -258,6 +265,7 @@ class _FakeVulkan:
     ) -> int:
         assert count.value == 1
         self.entry_point = infos.contents.stage.pName
+        self.specialization = _read_specialization(infos.contents.stage)
         return self._create("vkCreateComputePipelines", pipelines, "create-pipeline")
 
     def vkDestroyPipeline(self, device: Any, pipeline: Any, allocator: Any) -> None:  # noqa: N802
@@ -403,6 +411,28 @@ def _open(lib: _FakeVulkan, **kwargs: Any) -> vc.VulkanContext:
 # --------------------------------------------------------------------------
 # memory type selection (pure)
 # --------------------------------------------------------------------------
+
+
+def _read_specialization(
+    stage: vc._VkPipelineShaderStageCreateInfo,
+) -> list[tuple[int, bytes]]:
+    """Decode ``pSpecializationInfo`` the way a driver would: id -> raw bytes."""
+    if not stage.pSpecializationInfo:
+        return []
+    info = ctypes.cast(
+        stage.pSpecializationInfo, ctypes.POINTER(vc._VkSpecializationInfo)
+    ).contents
+    blob = ctypes.string_at(info.pData, info.dataSize)
+    entries = ctypes.cast(
+        info.pMapEntries, ctypes.POINTER(vc._VkSpecializationMapEntry)
+    )
+    return [
+        (
+            entries[index].constantID,
+            blob[entries[index].offset : entries[index].offset + entries[index].size],
+        )
+        for index in range(info.mapEntryCount)
+    ]
 
 
 def _spirv(words: list[int] | None = None) -> bytes:
@@ -908,6 +938,92 @@ def test_pipeline_honours_a_custom_entry_point() -> None:
         assert lib.entry_point == b"attention"
 
 
+def test_pipeline_without_specialization_passes_none() -> None:
+    """Omitting the constants leaves ``pSpecializationInfo`` null."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1)
+        assert lib.specialization == []
+        assert pipeline.specialization == {}
+
+
+def test_specialization_constants_reach_the_shader_stage() -> None:
+    """Each constant becomes a 4-byte slot, ordered by id whatever the input."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV,
+            buffer_count=1,
+            specialization={7: 2.5, 0: 64, 3: True, 1: -2, 5: False},
+        )
+        assert lib.specialization == [
+            (0, struct.pack("<I", 64)),
+            (1, struct.pack("<i", -2)),
+            (3, struct.pack("<I", 1)),
+            (5, struct.pack("<I", 0)),
+            (7, struct.pack("<f", 2.5)),
+        ]
+        assert pipeline.specialization == {7: 2.5, 0: 64, 3: True, 1: -2, 5: False}
+
+
+def test_specialization_property_is_a_copy() -> None:
+    """Mutating what the property returns cannot change the built pipeline."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=1, specialization={0: 16}
+        )
+        pipeline.specialization[0] = 32
+        assert pipeline.specialization == {0: 16}
+
+
+def test_empty_specialization_is_the_same_as_none() -> None:
+    """An empty mapping means the shader keeps every default."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=1, specialization={}
+        )
+        assert lib.specialization == []
+        assert pipeline.specialization == {}
+
+
+@pytest.mark.parametrize(
+    ("specialization", "message"),
+    [
+        ([(0, 1)], "must be a mapping"),
+        ({"0": 1}, "constant id must be an integer"),
+        ({True: 1}, "constant id must be an integer"),
+        ({-1: 1}, "constant id must fit in a uint32"),
+        ({1 << 32: 1}, "constant id must fit in a uint32"),
+        ({0: "64"}, "must be a bool, int or float"),
+        ({0: None}, "must be a bool, int or float"),
+        ({0: 1 << 32}, "does not fit in a 32-bit int"),
+        ({0: -(1 << 31) - 1}, "does not fit in a 32-bit int"),
+    ],
+)
+def test_specialization_rejects_invalid_input(
+    specialization: Any, message: str
+) -> None:
+    """Bad ids and unencodable values are refused before the driver sees them."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx, pytest.raises(vc.VulkanError, match=message):
+        ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=1, specialization=specialization
+        )
+        assert ctx.live_pipelines == 0
+
+
+@pytest.mark.parametrize("value", [0, 0xFFFFFFFF, -(1 << 31)])
+def test_specialization_accepts_the_32_bit_boundaries(value: int) -> None:
+    """The widest ints a 4-byte slot can hold are packed, not rejected."""
+    lib = _FakeVulkan()
+    with _open(lib) as ctx:
+        ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1, specialization={0: value})
+        expected = struct.pack("<i" if value < 0 else "<I", value)
+        assert lib.specialization == [(0, expected)]
+
+
 def test_dispatch_records_bindings_constants_and_barrier() -> None:
     """One dispatch binds each buffer in order and ends with a host barrier."""
     lib = _FakeVulkan()
@@ -1321,3 +1437,43 @@ def test_dispatch_on_a_real_device(device_index: int) -> None:
             assert np.array_equal(dst.read(np.float32, data.shape), data * -0.5)
             assert pipeline.dispatch_count == 2
         assert ctx.live_pipelines == 0
+
+
+@pytest.mark.skipif(not vulkan_available(), reason="no Vulkan compute device")
+@pytest.mark.parametrize("device_index", _compute_device_indices())
+def test_specialization_on_a_real_device(device_index: int) -> None:
+    """A driver compiles the same module twice with different constants.
+
+    The workgroup size is itself specialized, so a run whose constants were
+    dropped would also cover the wrong slice of the buffer, not merely compute
+    the wrong value.
+    """
+    data = np.arange(1000, dtype=np.float32)
+    count = struct.pack("<I", data.size)
+    spirv = _SPECIALIZED_SPV.read_bytes()
+    local_size = 32
+    with vc.VulkanContext.open(device_index=device_index) as ctx:
+        src = ctx.allocate(data.nbytes)
+        dst = ctx.allocate(data.nbytes)
+        src.write(data)
+        with ctx.compute_pipeline(
+            spirv,
+            buffer_count=2,
+            push_constant_bytes=4,
+            specialization={0: local_size, 1: -3, 2: 2.5, 3: True},
+        ) as pipeline:
+            pipeline.dispatch(
+                [src, dst],
+                groups=(data.size + local_size - 1) // local_size,
+                push_constants=count,
+            )
+            expected = -(data * 2.5 - 3.0)
+            assert np.array_equal(dst.read(np.float32, data.shape), expected)
+
+        # Unspecialized, the same SPIR-V keeps its defaults: local size 1,
+        # FACTOR 1.0, OFFSET 0, NEGATE false, so the kernel is a copy.
+        with ctx.compute_pipeline(
+            spirv, buffer_count=2, push_constant_bytes=4
+        ) as pipeline:
+            pipeline.dispatch([src, dst], groups=data.size, push_constants=count)
+            assert np.array_equal(dst.read(np.float32, data.shape), data)

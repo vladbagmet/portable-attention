@@ -207,6 +207,25 @@ it, and a module compiled for the opposite byte order is named as such. A
 pipeline is owned by its context like a buffer, and a failure part-way through
 creating one destroys the objects already made.
 
+Values that a shader needs at compile time — a workgroup size, a tile shape, the
+length of a shared array — go in as specialization constants rather than push
+constants:
+
+```python
+with ctx.compute_pipeline(
+    spirv,
+    buffer_count=2,
+    push_constant_bytes=4,
+    specialization={0: 32, 1: 64, 2: 0.125},  # layout(constant_id = N)
+) as pipe:
+    ...
+```
+
+The driver compiles the module with those values baked in, so one SPIR-V file
+covers several tile shapes without a recompile of the GLSL. Each constant is a
+`bool`, `int` or `float` and fills one 4-byte slot; ids the shader declares and
+the mapping omits keep their GLSL defaults.
+
 ### Tile sizing
 
 A blocked (flash-style) attention kernel streams the key/value sequence in
