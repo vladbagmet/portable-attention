@@ -617,11 +617,29 @@ def _require_specialization_value(
             )
         return value
     if isinstance(value, float):
-        return value
+        return _to_binary32(constant_id, value)
     raise VulkanError(
         f"specialization constant {constant_id} must be a bool, int or float, "
         f"got {type(value).__name__}"
     )
+
+
+def _to_binary32(constant_id: int, value: float) -> float:
+    """Round a Python float to the binary32 the shader will actually see.
+
+    Python floats are binary64; the slot is binary32. Storing the rounded value
+    keeps :attr:`VulkanPipeline.specialization` honest about what was compiled
+    in, and a magnitude with no binary32 at all is rejected here rather than
+    escaping as a raw ``OverflowError`` from the packing step.
+    """
+    try:
+        rounded: float = struct.unpack("=f", struct.pack("=f", value))[0]
+    except OverflowError:
+        raise VulkanError(
+            f"specialization constant {constant_id} value {value} is outside "
+            "the range of a 32-bit float"
+        ) from None
+    return rounded
 
 
 def _pack_specialization_value(value: SpecializationValue) -> bytes:
@@ -631,12 +649,16 @@ def _pack_specialization_value(value: SpecializationValue) -> bytes:
     ``bool`` is a 32-bit 0/1. Non-negative ints pack as ``uint32`` and negative
     ones as ``int32``; both fill the same slot, and the shader's declared type
     decides how the bits are read.
+
+    The formats are native-endian (``=``): Vulkan reads specialization data as
+    the host's own representation of the constant, not as a byte stream with a
+    fixed order.
     """
     if isinstance(value, bool):
-        return struct.pack("<I", 1 if value else 0)
+        return struct.pack("=I", 1 if value else 0)
     if isinstance(value, int):
-        return struct.pack("<i" if value < 0 else "<I", value)
-    return struct.pack("<f", value)
+        return struct.pack("=i" if value < 0 else "=I", value)
+    return struct.pack("=f", value)
 
 
 def _require_groups(groups: int | Sequence[int]) -> tuple[int, int, int]:

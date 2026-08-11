@@ -1000,6 +1000,8 @@ def test_empty_specialization_is_the_same_as_none() -> None:
         ({0: None}, "must be a bool, int or float"),
         ({0: 1 << 32}, "does not fit in a 32-bit int"),
         ({0: -(1 << 31) - 1}, "does not fit in a 32-bit int"),
+        ({0: 3.5e38}, "outside the range of a 32-bit float"),
+        ({0: -3.5e38}, "outside the range of a 32-bit float"),
     ],
 )
 def test_specialization_rejects_invalid_input(
@@ -1007,10 +1009,11 @@ def test_specialization_rejects_invalid_input(
 ) -> None:
     """Bad ids and unencodable values are refused before the driver sees them."""
     lib = _FakeVulkan()
-    with _open(lib) as ctx, pytest.raises(vc.VulkanError, match=message):
-        ctx.compute_pipeline(
-            _MINIMAL_SPIRV, buffer_count=1, specialization=specialization
-        )
+    with _open(lib) as ctx:
+        with pytest.raises(vc.VulkanError, match=message):
+            ctx.compute_pipeline(
+                _MINIMAL_SPIRV, buffer_count=1, specialization=specialization
+            )
         assert ctx.live_pipelines == 0
 
 
@@ -1020,8 +1023,20 @@ def test_specialization_accepts_the_32_bit_boundaries(value: int) -> None:
     lib = _FakeVulkan()
     with _open(lib) as ctx:
         ctx.compute_pipeline(_MINIMAL_SPIRV, buffer_count=1, specialization={0: value})
-        expected = struct.pack("<i" if value < 0 else "<I", value)
+        expected = struct.pack("=i" if value < 0 else "=I", value)
         assert lib.specialization == [(0, expected)]
+
+
+def test_specialization_reports_the_float_the_shader_gets() -> None:
+    """A float64 with no exact binary32 is stored as the rounded value."""
+    lib = _FakeVulkan()
+    binary32 = struct.unpack("=f", struct.pack("=f", 0.1))[0]
+    with _open(lib) as ctx:
+        pipeline = ctx.compute_pipeline(
+            _MINIMAL_SPIRV, buffer_count=1, specialization={0: 0.1}
+        )
+        assert pipeline.specialization == {0: binary32}
+        assert pipeline.specialization[0] != 0.1
 
 
 def test_dispatch_records_bindings_constants_and_barrier() -> None:
