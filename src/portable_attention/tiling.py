@@ -25,6 +25,17 @@ The thread mapping is one invocation per score element, so a workgroup holds
 the group reduces along the key axis for the softmax. Both block sizes are
 powers of two, which keeps the reduction tree and the subgroup split exact.
 
+The output accumulator is deliberately absent from that budget. It is one
+``block_q x head_dim`` block, about as large as the Q, K and V tiles together
+at the shapes this policy plans, and paying shared memory for it would cost
+more occupancy than it buys. It lives in registers instead: invocation
+``(i, j)`` owns output columns ``j``, ``j + block_k``, ``j + 2 * block_k``, ...
+of query row ``i`` and updates them from the score tile and the V tile that are
+already in shared memory. So an invocation holds at most
+``ceil(head_dim / block_k)`` accumulators, reported as
+:attr:`TilePlan.accumulators_per_invocation`, a count the preference order
+below keeps small by favouring wide key tiles.
+
 Among the tiles that fit, the policy prefers the largest workgroup (occupancy),
 then the widest key tile (fewer passes over K/V), then the widest query tile.
 Sequence lengths, when known, cap the blocks: each cap is the next power of two
@@ -147,6 +158,19 @@ class TilePlan:
     def shared_memory_utilization(self) -> float:
         """Fraction of the device's shared memory the layout occupies."""
         return self.shared_memory_bytes / self.limits.shared_memory_bytes
+
+    @property
+    def accumulators_per_invocation(self) -> int:
+        """Output accumulators one invocation keeps in registers.
+
+        The output block is outside the shared-memory budget (see the module
+        docstring): invocation ``(i, j)`` owns output columns ``j``,
+        ``j + block_k``, ... of query row ``i``, so the busiest one carries
+        ``ceil(head_dim / block_k)`` running values. Past a device's register
+        budget a kernel spills to local memory, so this is the number to watch
+        when a plan that fits turns out slow.
+        """
+        return -(-self.head_dim // self.block_k)
 
     @property
     def subgroups_per_group(self) -> float:

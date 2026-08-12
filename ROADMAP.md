@@ -50,6 +50,10 @@ reproducible benchmark harness.
   constants, submit and wait. Specialization constants fix a kernel's workgroup
   size and tile shape when the pipeline is built, so one committed SPIR-V file
   serves every tile plan. *(done: `VulkanPipeline`)*
+- **Blocked algorithm specification** — the tiled online-softmax attention a
+  device kernel implements, written once in NumPy over a `TilePlan` and checked
+  against the oracle, so the shader is a transcription with something to diff
+  against. *(done: `blocked_attention`)*
 - **Backend registration** gated on a compute-capable device, driving a minimal
   SPIR-V attention kernel, validated against the reference oracle through the
   conformance kit.
@@ -78,7 +82,9 @@ simd_width)`, and each backend supplies its own values — M2 pays for that seam
 so M3 gets a tile size instead of a second hand-tuned kernel. That seam now
 exists as `portable_attention.tiling`: on V3D at `head_dim=64` in float32 it
 plans a 16x16 tile filling the 256-invocation workgroup in 13440 of the 16384
-available bytes.
+available bytes. The output accumulator stays out of that budget — a
+`block_q x head_dim` block would cost more occupancy than it buys, so it is
+register-resident, 4 values per invocation at that plan.
 
 ## M3 — Metal backend (Apple Silicon)
 

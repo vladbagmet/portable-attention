@@ -99,6 +99,24 @@ def test_v3d_float32_head_dim_64_plan():
     assert plan.shared_memory_bytes == 13440
     assert plan.subgroups_per_group == 16.0
     assert 0.8 < plan.shared_memory_utilization < 0.9
+    # 64 output columns spread over a 16-wide key tile: 4 per invocation.
+    assert plan.accumulators_per_invocation == 4
+
+
+@pytest.mark.parametrize(
+    ("limits", "head_dim", "dtype_bytes"),
+    [(d, h, b) for d, h, b in itertools.product(DEVICES, HEAD_DIMS, DTYPE_BYTES)],
+)
+def test_accumulators_cover_every_output_column(limits, head_dim, dtype_bytes):
+    # The register-resident output block is only correct if the invocations of
+    # one query row between them own all head_dim columns, with the busiest
+    # holding the reported count.
+    plan = plan_tiles(head_dim, dtype_bytes, limits)
+    owned = [
+        len(range(lane, plan.head_dim, plan.block_k)) for lane in range(plan.block_k)
+    ]
+    assert sum(owned) == plan.head_dim
+    assert max(owned) == plan.accumulators_per_invocation
 
 
 def test_wider_device_is_never_worse():

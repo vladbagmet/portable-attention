@@ -249,7 +249,30 @@ a full workgroup, then a wide key tile. Pass `seq_len_q` / `seq_len_k` when they
 are known and the blocks are capped at the next power of two at or above the
 length, so a short input stops drawing a tile it can never fill. The layout being
 priced is documented on `shared_memory_bytes_for`; a kernel calls it too, so both
-sides bill the same budget. No backend consumes the policy yet.
+sides bill the same budget. The output accumulator is not in that budget — it is
+register-resident, `plan.accumulators_per_invocation` values per invocation. No
+backend consumes the policy yet.
+
+### The blocked algorithm, written down
+
+A device kernel that returns a wrong number does not say whether tiling,
+masking, the online-softmax rescale or the accumulator layout was at fault.
+`blocked_attention` is the same algorithm in NumPy, driven by a `TilePlan`, so a
+kernel can be diffed against a host implementation making identical decisions —
+padded trailing tiles, per-row running max and sum, causal tile skipping:
+
+```python
+from portable_attention import blocked_attention, plan_tiles
+from portable_attention.tiling import V3D_LIMITS
+
+plan = plan_tiles(head_dim=64, dtype_bytes=4, limits=V3D_LIMITS)
+out = blocked_attention(q, k, v, plan, is_causal=True)  # (n, seq, 64) each
+```
+
+It is a specification to port from, not a backend to serve traffic with: it
+walks tiles in Python and is slower than either CPU backend. Inputs are the flat
+`(n, seq, head_dim)` stack a dispatch sees, so reshape `(*, H, S, E)` down to it
+first; masks, GQA and dropout stay with the real backends.
 
 ### Conformance kit
 
