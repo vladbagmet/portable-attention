@@ -40,6 +40,7 @@ def test_public_exports_are_frozen():
         "__version__",
         "assert_conforms",
         "available_backends",
+        "blocked_attention",
         "check_backend",
         "conformance_cases",
         "detect_vulkan",

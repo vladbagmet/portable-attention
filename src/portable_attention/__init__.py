@@ -19,6 +19,9 @@ across the documented contract matrix.
 Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
 :class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
 shared-memory / workgroup / SIMD numbers instead of a second hand-tuned kernel.
+The algorithm those kernels implement is written out once in NumPy as
+:func:`blocked_attention`: a specification to port from and to diff a device
+kernel against, not a backend to serve traffic with.
 
 On hosts with Vulkan, :func:`detect_vulkan` reports what hardware is there and
 :class:`VulkanContext` opens it: a logical device, a compute queue, and
@@ -28,6 +31,7 @@ which a :class:`VulkanPipeline` then runs SPIR-V compute shaders over.
 
 from __future__ import annotations
 
+from .blocked import blocked_attention
 from .conformance import (
     ConformanceCase,
     ConformanceResult,
@@ -68,6 +72,7 @@ __all__ = [
     "__version__",
     "assert_conforms",
     "available_backends",
+    "blocked_attention",
     "check_backend",
     "conformance_cases",
     "detect_vulkan",
