@@ -1,0 +1,178 @@
+#version 450
+//
+// Blocked (flash-style) scaled dot-product attention, forward, float32.
+//
+// A transcription of portable_attention/blocked.py: same tiling, same online
+// softmax, same padding and causal rules, same register-resident output
+// accumulator. Diff a dispatch of this shader against blocked_attention() on
+// the same inputs before blaming the algorithm.
+//
+// One workgroup owns BLOCK_Q query rows of one (batch*head) slice and streams
+// the key/value sequence BLOCK_K rows at a time. Invocation (i, j) computes
+// score element (i, j) and owns output columns j, j + BLOCK_K, ... of query
+// row i; those accumulators live in registers, which is why the shared-memory
+// budget in tiling.py has no output tile.
+//
+// Every tile shape is a specialization constant, so the plan chosen by
+// plan_tiles() for a device is baked in when the pipeline is built. Compiled
+// to attention.spv, committed next to this file:
+//
+//   glslangValidator -V --target-env vulkan1.0 -S comp -o attention.spv attention.comp
+//
+layout(local_size_x_id = 0, local_size_x = 1,
+       local_size_y_id = 1, local_size_y = 1) in;
+
+// Tile shape. Ids 0/1 above are the workgroup size: x is the key lane
+// (BLOCK_K), y is the query row (BLOCK_Q).
+layout(constant_id = 2) const int BLOCK_Q = 1;
+layout(constant_id = 3) const int BLOCK_K = 1;
+layout(constant_id = 4) const int HEAD_DIM = 1;
+
+// Shared-array lengths, passed in rather than derived, so the host and the
+// driver agree on the allocation the tile budget was priced for.
+layout(constant_id = 5) const int Q_TILE_LEN = 1;   // BLOCK_Q * HEAD_DIM
+layout(constant_id = 6) const int KV_TILE_LEN = 1;  // BLOCK_K * HEAD_DIM
+layout(constant_id = 7) const int S_TILE_LEN = 1;   // BLOCK_Q * BLOCK_K
+// Output accumulators one invocation carries: ceil(HEAD_DIM / BLOCK_K).
+layout(constant_id = 8) const int ACC_LEN = 1;
+
+layout(std430, set = 0, binding = 0) readonly buffer Query { float value[]; } qBuf;
+layout(std430, set = 0, binding = 1) readonly buffer Key { float value[]; } kBuf;
+layout(std430, set = 0, binding = 2) readonly buffer Value { float value[]; } vBuf;
+layout(std430, set = 0, binding = 3) writeonly buffer Output { float value[]; } oBuf;
+
+layout(push_constant) uniform Params {
+    uint seq_q;
+    uint seq_k;
+    float scale;
+    uint causal;
+} params;
+
+shared float qTile[Q_TILE_LEN];
+shared float kTile[KV_TILE_LEN];
+shared float vTile[KV_TILE_LEN];
+shared float sTile[S_TILE_LEN];
+shared float rowMaxState[BLOCK_Q];
+shared float rowSumState[BLOCK_Q];
+
+// -inf as a bit pattern: a literal would have to be spelled as a division by
+// zero, which the compiler rejects at global scope.
+#define NEG_INF uintBitsToFloat(0xFF800000u)
+
+void main() {
+    const uint row = gl_LocalInvocationID.y;   // query row within the tile
+    const uint lane = gl_LocalInvocationID.x;  // key lane within the tile
+    const uint tid = row * uint(BLOCK_K) + lane;
+    const uint groupSize = uint(BLOCK_Q) * uint(BLOCK_K);
+
+    const uint qStart = gl_WorkGroupID.x * uint(BLOCK_Q);
+    const uint slice = gl_WorkGroupID.y;
+    const uint qBase = slice * params.seq_q * uint(HEAD_DIM);
+    const uint kvBase = slice * params.seq_k * uint(HEAD_DIM);
+    const uint queryIndex = qStart + row;
+
+    // Q stays resident for the whole workgroup; K and V stream past it.
+    for (uint idx = tid; idx < uint(Q_TILE_LEN); idx += groupSize) {
+        uint r = idx / uint(HEAD_DIM);
+        uint c = idx % uint(HEAD_DIM);
+        uint g = qStart + r;
+        qTile[idx] = g < params.seq_q ? qBuf.value[qBase + g * uint(HEAD_DIM) + c] : 0.0;
+    }
+    if (lane == 0u) {
+        rowMaxState[row] = NEG_INF;
+        rowSumState[row] = 0.0;
+    }
+
+    float acc[ACC_LEN];
+    for (int c = 0; c < ACC_LEN; ++c) {
+        acc[c] = 0.0;
+    }
+
+    for (uint kStart = 0u; kStart < params.seq_k; kStart += uint(BLOCK_K)) {
+        // Uniform across the workgroup: every key of this tile sits strictly
+        // after every query row of it, so nothing below it can contribute.
+        if (params.causal != 0u && kStart > qStart + uint(BLOCK_Q) - 1u) {
+            break;
+        }
+        barrier();
+        for (uint idx = tid; idx < uint(KV_TILE_LEN); idx += groupSize) {
+            uint r = idx / uint(HEAD_DIM);
+            uint c = idx % uint(HEAD_DIM);
+            uint g = kStart + r;
+            bool live = g < params.seq_k;
+            uint at = kvBase + g * uint(HEAD_DIM) + c;
+            kTile[idx] = live ? kBuf.value[at] : 0.0;
+            vTile[idx] = live ? vBuf.value[at] : 0.0;
+        }
+        barrier();
+
+        float oldMax = rowMaxState[row];
+        uint keyIndex = kStart + lane;
+        bool allowed = queryIndex < params.seq_q && keyIndex < params.seq_k
+            && (params.causal == 0u || keyIndex <= queryIndex);
+        float score = NEG_INF;
+        if (allowed) {
+            float dot = 0.0;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                dot += qTile[row * uint(HEAD_DIM) + uint(d)]
+                    * kTile[lane * uint(HEAD_DIM) + uint(d)];
+            }
+            score = dot * params.scale;
+        }
+        sTile[row * uint(BLOCK_K) + lane] = score;
+        barrier();
+
+        // Every lane reduces its own row: BLOCK_K reads instead of a tree and
+        // its scratch space, which the shared-memory budget does not carry.
+        float tileMax = NEG_INF;
+        for (int j = 0; j < BLOCK_K; ++j) {
+            tileMax = max(tileMax, sTile[row * uint(BLOCK_K) + uint(j)]);
+        }
+        float newMax = max(oldMax, tileMax);
+        // A row with nothing allowed yet is still -inf; shifting it by 0 keeps
+        // the exponentials at 0 instead of producing -inf - -inf = nan.
+        if (isinf(newMax) || isnan(newMax)) {
+            newMax = 0.0;
+        }
+        float weight = exp(score - newMax);
+        barrier();
+        sTile[row * uint(BLOCK_K) + lane] = weight;
+        barrier();
+
+        float rescale = exp(oldMax - newMax);
+        for (int c = 0; c < ACC_LEN; ++c) {
+            uint col = lane + uint(c) * uint(BLOCK_K);
+            if (col < uint(HEAD_DIM)) {
+                float sum = 0.0;
+                for (int j = 0; j < BLOCK_K; ++j) {
+                    sum += sTile[row * uint(BLOCK_K) + uint(j)]
+                        * vTile[uint(j) * uint(HEAD_DIM) + col];
+                }
+                acc[c] = acc[c] * rescale + sum;
+            }
+        }
+        if (lane == 0u) {
+            float rowSum = 0.0;
+            for (int j = 0; j < BLOCK_K; ++j) {
+                rowSum += sTile[row * uint(BLOCK_K) + uint(j)];
+            }
+            rowSumState[row] = rowSumState[row] * rescale + rowSum;
+            rowMaxState[row] = newMax;
+        }
+    }
+
+    barrier();
+    if (queryIndex >= params.seq_q) {
+        return;
+    }
+    // A row that never saw an allowed key divides 0 by 0; the contract makes
+    // its output exactly zero.
+    float denom = rowSumState[row];
+    for (int c = 0; c < ACC_LEN; ++c) {
+        uint col = lane + uint(c) * uint(BLOCK_K);
+        if (col < uint(HEAD_DIM)) {
+            oBuf.value[qBase + queryIndex * uint(HEAD_DIM) + col] =
+                denom > 0.0 ? acc[c] / denom : 0.0;
+        }
+    }
+}
