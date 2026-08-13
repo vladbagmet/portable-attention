@@ -38,6 +38,11 @@ BUFFER_COUNT = 4
 #: Size of the shader's push-constant block: seq_q, seq_k, scale, causal.
 PUSH_CONSTANT_BYTES = 16
 
+#: Workgroups a single dispatch axis may carry. Vulkan guarantees at least
+#: this many everywhere (``maxComputeWorkGroupCount``), and a launch that wants
+#: more is not portable, so a shape is refused here rather than at dispatch.
+MAX_GROUPS_PER_AXIS = 65535
+
 #: Element size the kernel is written for. It reads and writes float32 storage
 #: buffers, so a plan sized for anything else describes a different shader.
 KERNEL_DTYPE_BYTES = 4
@@ -119,7 +124,8 @@ def attention_launch(
 
     Raises:
         ValueError: If a count is not a positive integer, the plan is not a
-            float32 plan, or ``scale`` is not a finite float32 value.
+            float32 plan, ``scale`` is not a finite float32 value, or the
+            shape needs more workgroups on one axis than Vulkan guarantees.
     """
     if plan.dtype_bytes != KERNEL_DTYPE_BYTES:
         raise ValueError(
@@ -142,12 +148,22 @@ def attention_launch(
         7: block_q * block_k,  # score tile
         8: plan.accumulators_per_invocation,
     }
+    groups = (plan.q_tiles(seq_q), stack, 1)
+    for axis, (label, count) in enumerate(
+        ((f"{seq_q} query rows in tiles of {block_q}", groups[0]), ("stack", stack))
+    ):
+        if count > MAX_GROUPS_PER_AXIS:
+            raise ValueError(
+                f"{label} needs {count} workgroups on axis {axis}, above the "
+                f"{MAX_GROUPS_PER_AXIS} per axis Vulkan guarantees; split the "
+                "dispatch."
+            )
     return AttentionLaunch(
         specialization=specialization,
         push_constants=_pack_push_constants(
             seq_q=seq_q, seq_k=seq_k, scale=scale, is_causal=is_causal
         ),
-        groups=(plan.q_tiles(seq_q), stack, 1),
+        groups=groups,
         plan=plan,
     )
 

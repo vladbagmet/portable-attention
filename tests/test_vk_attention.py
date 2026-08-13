@@ -22,6 +22,7 @@ from portable_attention.blocked import blocked_attention
 from portable_attention.tiling import V3D_LIMITS, TilePlan, plan_tiles
 from portable_attention.vkattention import (
     BUFFER_COUNT,
+    MAX_GROUPS_PER_AXIS,
     PUSH_CONSTANT_BYTES,
     attention_launch,
     attention_spirv,
@@ -156,6 +157,38 @@ def test_rejects_counts_that_are_not_positive_ints(field: str, bad: object) -> N
 def test_rejects_a_scale_that_is_not_finite(scale: float) -> None:
     with pytest.raises(ValueError, match="finite"):
         attention_launch(_plan(), stack=1, seq_q=4, seq_k=4, scale=scale)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_rejects_a_shape_needing_more_workgroups_than_vulkan_guarantees(
+    axis: int,
+) -> None:
+    """An axis over 65535 workgroups is refused while the shape is still known.
+
+    ``dispatch()`` would catch it too, but by then the message is about
+    workgroup counts rather than about the sequence or batch that produced them.
+    """
+    plan = _plan()
+    shapes = {"stack": 1, "seq_q": 8, "seq_k": 8}
+    if axis == 0:
+        shapes["seq_q"] = (MAX_GROUPS_PER_AXIS + 1) * plan.block_q
+    else:
+        shapes["stack"] = MAX_GROUPS_PER_AXIS + 1
+    with pytest.raises(ValueError, match=f"axis {axis}"):
+        attention_launch(plan, scale=1.0, **shapes)
+
+
+def test_the_largest_supported_dispatch_is_accepted() -> None:
+    """The limit itself is fine; only the row above it is refused."""
+    plan = _plan()
+    launch = attention_launch(
+        plan,
+        stack=MAX_GROUPS_PER_AXIS,
+        seq_q=MAX_GROUPS_PER_AXIS * plan.block_q,
+        seq_k=8,
+        scale=1.0,
+    )
+    assert launch.groups == (MAX_GROUPS_PER_AXIS, MAX_GROUPS_PER_AXIS, 1)
 
 
 def test_rejects_a_scale_the_float32_slot_cannot_hold() -> None:
