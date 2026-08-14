@@ -263,6 +263,14 @@ def test_device_path_returns_the_reference_answer() -> None:
     assert ctx.pipelines[0].dispatches[0][0][1] == 6  # one workgroup row per slice
 
 
+def test_the_output_can_be_written_to() -> None:
+    """A device read is backed by immutable bytes; the caller must not notice."""
+    backend, _ = _fake_backend()
+    got = backend(*_inputs())
+    assert got.flags.writeable
+    got += 1.0
+
+
 def test_two_dimensional_inputs_dispatch_as_one_slice() -> None:
     """``(L, E)`` has no leading axes; it becomes a stack of one and comes back flat."""
     backend, _ = _fake_backend()
@@ -469,6 +477,7 @@ def test_device_output_matches_the_oracle(
         backend.close()
     oracle = get_backend("reference")(q, k, v, is_causal=is_causal)
     np.testing.assert_allclose(got, oracle, rtol=1e-5, atol=1e-5)
+    assert got.flags.writeable
 
 
 @pytest.mark.skipif(not vulkan_available(), reason="no Vulkan compute device")

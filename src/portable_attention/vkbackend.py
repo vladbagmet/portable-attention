@@ -348,8 +348,12 @@ class VulkanAttention:
             groups=groups,
             push_constants=push_constants,
         )
-        out: NDArray[np.float32] = _live(self._buffers[_OUTPUT]).read(
-            KERNEL_DTYPE, flat_q.shape
+        # The buffer read is backed by immutable bytes, so it comes back
+        # read-only; every other backend returns an array the caller may write
+        # to, and one copy of the output is cheap next to the attention itself.
+        out: NDArray[np.float32] = np.array(
+            _live(self._buffers[_OUTPUT]).read(KERNEL_DTYPE, flat_q.shape),
+            dtype=KERNEL_DTYPE,
         )
         return out
 
