@@ -350,6 +350,16 @@ def test_masked_and_gqa_calls_go_to_the_cpu() -> None:
     np.testing.assert_allclose(
         got, get_backend("reference")(q, k, v, mask), rtol=1e-5, atol=1e-5
     )
+
+    grouped_k, grouped_v = _inputs(stack=(2, 1))[1:]
+    grouped = backend(q, grouped_k, grouped_v, enable_gqa=True)
+    np.testing.assert_allclose(
+        grouped,
+        get_backend("reference")(q, grouped_k, grouped_v, enable_gqa=True),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
     assert backend.device_calls == 0
     assert ctx.buffers == [] and ctx.pipelines == []
 
