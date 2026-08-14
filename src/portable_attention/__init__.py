@@ -26,7 +26,12 @@ kernel against, not a backend to serve traffic with.
 On hosts with Vulkan, :func:`detect_vulkan` reports what hardware is there and
 :class:`VulkanContext` opens it: a logical device, a compute queue, and
 host-visible :class:`VulkanBuffer` allocations arrays can be copied through,
-which a :class:`VulkanPipeline` then runs SPIR-V compute shaders over.
+which a :class:`VulkanPipeline` then runs SPIR-V compute shaders over. Where
+such a device exists, importing this package registers a ``"vulkan"`` backend
+that runs the blocked-attention shader and falls back to the CPU for calls the
+kernel does not implement; select it with ``get_backend("vulkan")``. Set
+``PORTABLE_ATTENTION_DISABLE_VULKAN`` to skip both the probe and the
+registration.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ from .tiling import (
     plan_tiles,
     shared_memory_bytes_for,
 )
+from .vkbackend import VulkanAttention, register_vulkan_backend
 from .vkcompute import VulkanBuffer, VulkanContext, VulkanError, VulkanPipeline
 from .vulkan import VulkanCapability, VulkanDevice, detect_vulkan, vulkan_available
 
@@ -63,6 +69,7 @@ __all__ = [
     "SdpaBackend",
     "TilePlan",
     "TileSizingError",
+    "VulkanAttention",
     "VulkanBuffer",
     "VulkanCapability",
     "VulkanContext",
@@ -79,6 +86,7 @@ __all__ = [
     "get_backend",
     "plan_tiles",
     "register_backend",
+    "register_vulkan_backend",
     "scaled_dot_product_attention",
     "shared_memory_bytes_for",
     "vulkan_available",
@@ -88,3 +96,7 @@ __all__ = [
 # (hatchling) reads this string directly via [tool.hatch.version] in
 # pyproject.toml, so it must never be duplicated there.
 __version__ = "0.0.1"
+
+# Registers only where the host has a compute-capable Vulkan device, so this is
+# a no-op (one detection probe) on CPU-only machines.
+register_vulkan_backend()
