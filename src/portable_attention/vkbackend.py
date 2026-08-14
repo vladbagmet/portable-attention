@@ -228,7 +228,7 @@ class VulkanAttention:
         :func:`portable_attention.scaled_dot_product_attention` exactly; the
         output is float32 with the leading axes of ``query``.
         """
-        if self._device_usable and (
+        if (
             unsupported_reason(
                 query,
                 key,
@@ -258,11 +258,15 @@ class VulkanAttention:
     def close(self) -> None:
         """Release the device, its pipelines and its buffers. Idempotent."""
         with self._lock:
-            context, self._context = self._context, None
-            self._pipelines.clear()
-            self._buffers = [None] * BUFFER_COUNT
-            if context is not None:
-                context.close()
+            self._close_held()
+
+    def _close_held(self) -> None:
+        """Release the device; the caller already holds the lock."""
+        context, self._context = self._context, None
+        self._pipelines.clear()
+        self._buffers = [None] * BUFFER_COUNT
+        if context is not None:
+            context.close()
 
     def _run(
         self,
@@ -303,6 +307,10 @@ class VulkanAttention:
         flat_v = _as_stack(value, stack)
         try:
             with self._lock:
+                if not self._device_usable:
+                    # A device that failed once is not tried again, and the
+                    # flag is only ever read here, under the lock.
+                    return None
                 flat_out = self._dispatch(
                     flat_q,
                     flat_k,
@@ -387,18 +395,26 @@ class VulkanAttention:
         return pipeline
 
     def _retire_device(self, exc: VulkanError) -> None:
-        """Stop using the device after a failure and say so once."""
-        self._device_usable = False
-        warnings.warn(
-            f"the Vulkan attention backend hit a device error ({exc}); "
-            "the rest of this process is served by the CPU backend",
-            RuntimeWarning,
-            stacklevel=4,
-        )
-        # Teardown of a device that just failed can fail in turn; the CPU
-        # path is already the answer, so nothing here is worth raising.
-        with contextlib.suppress(VulkanError):
-            self.close()
+        """Stop using the device after a failure and say so once.
+
+        Retirement, teardown and the warning are one atomic step, so a second
+        thread that fails on the same device neither reopens it nor repeats the
+        warning.
+        """
+        with self._lock:
+            first = self._device_usable
+            self._device_usable = False
+            # Teardown of a device that just failed can fail in turn; the CPU
+            # path is already the answer, so nothing here is worth raising.
+            with contextlib.suppress(VulkanError):
+                self._close_held()
+        if first:
+            warnings.warn(
+                f"the Vulkan attention backend hit a device error ({exc}); "
+                "the rest of this process is served by the CPU backend",
+                RuntimeWarning,
+                stacklevel=4,
+            )
 
 
 def _as_stack(array: Array, stack: int) -> NDArray[np.float32]:
@@ -436,7 +452,13 @@ def register_vulkan_backend(
     if env.get(DISABLE_ENV_VAR):
         return False
     if capability is None:
-        capability = detect_vulkan()
+        try:
+            capability = detect_vulkan()
+        except Exception:  # noqa: BLE001 - importing must never fail on a probe
+            # Detection walks a foreign loader through ctypes. It handles the
+            # failures it knows about, and an unknown one still has an obvious
+            # answer here: this host does not get the backend.
+            return False
     if not capability.available:
         return False
     register_backend("vulkan", VulkanAttention(), overwrite=overwrite)

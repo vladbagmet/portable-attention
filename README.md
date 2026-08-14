@@ -77,7 +77,7 @@ fast path automatically. To resolve a specific backend explicitly:
 ```python
 from portable_attention import available_backends, get_backend
 
-print(available_backends())  # ['fused', 'reference'] (+ 'vulkan' on a GPU host)
+print(available_backends())  # ['fused', 'reference'] (+ 'vulkan', see below)
 out = get_backend("reference")(query, key, value)
 ```
 

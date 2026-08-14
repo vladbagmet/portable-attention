@@ -9,8 +9,10 @@ device exists, including the full conformance kit.
 
 from __future__ import annotations
 
+import importlib
 import struct
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -394,6 +396,58 @@ def test_a_device_failure_retires_the_device_once() -> None:
     assert backend.device_calls == 0
 
 
+def test_concurrent_calls_share_one_context() -> None:
+    """The lock covers opening the device, growing buffers and the counter."""
+    contexts: list[_FakeContext] = []
+
+    def opener(*, device_index: int | None) -> Any:
+        contexts.append(_FakeContext())
+        return contexts[-1]
+
+    backend = VulkanAttention(open_context=opener)  # type: ignore[arg-type]
+    # Varying lengths make the threads contend on buffer growth.
+    cases = [_inputs(seq_q=n, seq_k=n) for n in (4, 8, 12, 16)] * 4
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda qkv: backend(*qkv), cases))
+
+    assert len(contexts) == 1
+    assert backend.device_calls == len(cases)
+    for (q, k, v), got in zip(cases, results):
+        np.testing.assert_allclose(got, fused_sdpa(q, k, v), rtol=1e-5, atol=1e-5)
+
+
+def test_retiring_a_device_twice_warns_once() -> None:
+    """Retirement is idempotent, so a racing second failure stays quiet."""
+    backend, ctx = _fake_backend()
+    backend(*_inputs())
+
+    with pytest.warns(RuntimeWarning, match="device error"):
+        backend._retire_device(VulkanError("device lost"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        backend._retire_device(VulkanError("device lost again"))
+    assert ctx.closed
+
+
+def test_a_concurrent_device_failure_warns_once() -> None:
+    """Threads racing a dying device retire it together, not repeatedly."""
+
+    def opener(*, device_index: int | None) -> Any:
+        raise VulkanError("device lost")
+
+    backend = VulkanAttention(open_context=opener)  # type: ignore[arg-type]
+    cases = [_inputs() for _ in range(8)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda qkv: backend(*qkv), cases))
+
+    assert len(caught) == 1
+    assert not backend.device_usable
+    for (q, k, v), got in zip(cases, results):
+        np.testing.assert_allclose(got, fused_sdpa(q, k, v), rtol=1e-5, atol=1e-5)
+
+
 # --------------------------------------------------------------------------
 # registration
 # --------------------------------------------------------------------------
@@ -427,6 +481,29 @@ def test_the_opt_out_wins_over_a_present_device() -> None:
     assert not register_vulkan_backend(
         capability=_AVAILABLE, environ={DISABLE_ENV_VAR: "1"}
     )
+    assert "vulkan" not in available_backends()
+
+
+def test_registration_survives_a_reload_of_the_package() -> None:
+    """The registry outlives the module, so the import-time call overwrites."""
+    register_vulkan_backend(capability=_AVAILABLE, overwrite=True, environ={})
+    importlib.reload(importlib.import_module("portable_attention"))
+    assert "vulkan" in available_backends()
+
+
+def test_a_detection_failure_leaves_the_backend_unregistered() -> None:
+    """An import must not raise because probing a foreign loader went wrong."""
+    _REGISTRY.pop("vulkan", None)
+
+    def broken() -> VulkanCapability:
+        raise RuntimeError("the loader segfaulted politely")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("portable_attention.vkbackend.detect_vulkan", broken)
+        assert not register_vulkan_backend(environ={})
+    finally:
+        monkey.undo()
     assert "vulkan" not in available_backends()
 
 

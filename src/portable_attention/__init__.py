@@ -98,5 +98,7 @@ __all__ = [
 __version__ = "0.0.1"
 
 # Registers only where the host has a compute-capable Vulkan device, so this is
-# a no-op (one detection probe) on CPU-only machines.
-register_vulkan_backend()
+# a no-op (one detection probe) on CPU-only machines. ``overwrite`` because the
+# registry outlives a reload of this module, which would otherwise raise on the
+# name it registered the first time.
+register_vulkan_backend(overwrite=True)
