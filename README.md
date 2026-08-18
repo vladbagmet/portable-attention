@@ -60,7 +60,8 @@ set of names re-exported from the top-level package (its `__all__`):
 protocol, the conformance kit `assert_conforms`, `check_backend`,
 `conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
 detection helpers `detect_vulkan`, `vulkan_available`, `VulkanCapability`, and
-`VulkanDevice` (see
+`VulkanDevice`, and the Vulkan backend `VulkanAttention` with its
+`register_vulkan_backend` (see
 [Backends](#backends)); everything else is internal and may change.
 
 ## Backends
@@ -76,7 +77,7 @@ fast path automatically. To resolve a specific backend explicitly:
 ```python
 from portable_attention import available_backends, get_backend
 
-print(available_backends())  # ['fused', 'reference']
+print(available_backends())  # ['fused', 'reference'] (+ 'vulkan', see below)
 out = get_backend("reference")(query, key, value)
 ```
 
@@ -96,9 +97,9 @@ signature as `scaled_dot_product_attention`); register your own with
 
 ### Vulkan device detection
 
-The next backend on the roadmap (M2) is a portable GPU path built on **Vulkan
-(V3DV)**, so the package ships a detector that reports what Vulkan hardware the
-host actually exposes:
+The portable GPU path is built on **Vulkan (V3DV)**, and it starts with a
+detector that reports what Vulkan hardware the host actually exposes — the same
+check that decides whether the backend below registers:
 
 ```python
 from portable_attention import detect_vulkan, vulkan_available
@@ -250,8 +251,8 @@ are known and the blocks are capped at the next power of two at or above the
 length, so a short input stops drawing a tile it can never fill. The layout being
 priced is documented on `shared_memory_bytes_for`; a kernel calls it too, so both
 sides bill the same budget. The output accumulator is not in that budget — it is
-register-resident, `plan.accumulators_per_invocation` values per invocation. No
-backend consumes the policy yet.
+register-resident, `plan.accumulators_per_invocation` values per invocation. The
+Vulkan backend plans every dispatch through it.
 
 ### The blocked algorithm, written down
 
@@ -273,6 +274,40 @@ It is a specification to port from, not a backend to serve traffic with: it
 walks tiles in Python and is slower than either CPU backend. Inputs are the flat
 `(n, seq, head_dim)` stack a dispatch sees, so reshape `(*, H, S, E)` down to it
 first; masks, GQA and dropout stay with the real backends.
+
+### Vulkan attention backend
+
+Where the host has a compute-capable Vulkan device, importing the package
+registers a `"vulkan"` backend that runs the blocked-attention shader:
+
+```python
+from portable_attention import available_backends, get_backend
+
+print(available_backends())  # ['fused', 'reference', 'vulkan']
+out = get_backend("vulkan")(query, key, value, is_causal=True)
+```
+
+The kernel implements unmasked and causal float32 attention where query, key
+and value share a head dimension. Every other call the contract allows — masks,
+grouped-query attention, `float64`/`float16`, a value width that differs from
+the key width, a head dimension no tile plan fits — is forwarded to the `fused`
+CPU backend, so the backend passes the full conformance kit rather than only
+the cases it accelerates. Invalid input is forwarded too, so the error you get
+is the documented one.
+
+The device is opened on the first call it can serve, and the context, one
+pipeline per tile shape and four buffers (which grow with the shapes they see)
+are reused across calls. Tiles are planned against the limits every Vulkan
+implementation guarantees — 16 KiB of shared memory, 128 invocations per
+workgroup — until a context can report its device's own numbers, so plans stay
+valid on hardware this project has not measured. If the device fails mid-run
+the backend warns once and serves the rest of the process from the CPU: a
+wedged GPU costs throughput, not correctness.
+
+`"auto"` does not route to the device yet — that selection needs benchmark
+numbers, so for now the device is opt-in through `get_backend("vulkan")`.
+Setting `PORTABLE_ATTENTION_DISABLE_VULKAN` to any non-empty value skips both
+the detection probe and the registration.
 
 ### Conformance kit
 
