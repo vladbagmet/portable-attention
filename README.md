@@ -147,6 +147,7 @@ q = np.random.default_rng(0).standard_normal((4, 64), dtype=np.float32)
 
 with VulkanContext.open() as ctx:
     print(ctx.device_name, ctx.queue_family_index)  # V3D 7.1.7.0 0
+    print(ctx.tile_limits.shared_memory_bytes)  # 16384 on V3D
     with ctx.allocate(q.nbytes) as buf:
         buf.write(q)
         same = buf.read(q.dtype, q.shape)
@@ -158,6 +159,13 @@ chosen from the types the buffer allows, requiring `HOST_VISIBLE | HOST_COHERENT
 and preferring `DEVICE_LOCAL` as well — on unified-memory parts such as V3D that
 is the same heap, so no staging copy is needed. Buffers are created with
 `STORAGE_BUFFER` usage, which is what a compute shader binds.
+
+`tile_limits` reports what the device answers for
+`maxComputeSharedMemorySize` and its workgroup-size limits, as the
+`DeviceLimits` that `plan_tiles` takes; `subgroupSize` needs the Vulkan 1.1
+properties query this module does not make yet, so the width is the
+conservative `SUBGROUP_WIDTH_FALLBACK` and only affects which of two equally
+large tiles is preferred.
 
 The context owns what it creates: closing it frees buffers the caller forgot,
 then destroys the device and the instance. Both the context and its buffers work
@@ -297,10 +305,11 @@ is the documented one.
 
 The device is opened on the first call it can serve, and the context, one
 pipeline per tile shape and four buffers (which grow with the shapes they see)
-are reused across calls. Tiles are planned against the limits every Vulkan
-implementation guarantees — 16 KiB of shared memory, 128 invocations per
-workgroup — until a context can report its device's own numbers, so plans stay
-valid on hardware this project has not measured. If the device fails mid-run
+are reused across calls. Tiles are planned against the limits the open device
+reports, so a part with room to spare gets larger tiles than the Vulkan
+minimums would allow; `VulkanAttention(limits=...)` pins them instead, and
+`backend.limits` answers the minimums until a device has been opened. If the
+device fails mid-run
 the backend warns once and serves the rest of the process from the CPU: a
 wedged GPU costs throughput, not correctness.
 
