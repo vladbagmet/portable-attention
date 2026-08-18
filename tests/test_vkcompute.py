@@ -60,8 +60,12 @@ class _FakeVulkan:
         map_null: bool = False,
         null_instance: bool = False,
         device_limits: tuple[int, int, int] = _V3D_COMPUTE_LIMITS,
+        workgroup_sizes: tuple[int, int, int] | None = None,
     ) -> None:
         self.device_limits = device_limits
+        self.workgroup_sizes = (
+            (device_limits[2],) * 3 if workgroup_sizes is None else workgroup_sizes
+        )
         self.devices = devices
         self.memory_types = memory_types
         self.memory_type_bits = memory_type_bits
@@ -115,7 +119,7 @@ class _FakeVulkan:
         limits.maxComputeSharedMemorySize = shared
         limits.maxComputeWorkGroupInvocations = invocations
         for axis in range(3):
-            limits.maxComputeWorkGroupSize[axis] = per_axis
+            limits.maxComputeWorkGroupSize[axis] = self.workgroup_sizes[axis]
 
     def vkGetPhysicalDeviceQueueFamilyProperties(  # noqa: N802
         self, device: Any, count: Any, families: Any
@@ -518,26 +522,36 @@ def test_open_reports_tile_limits_from_the_device() -> None:
     assert "V3D 7.1.7.0" in limits.name
 
 
-def test_a_narrow_workgroup_axis_caps_the_thread_count() -> None:
-    """A tile spans two axes, so the smaller per-axis limit is the binding one."""
-    lib = _FakeVulkan(device_limits=(16384, 1024, 64))
+@pytest.mark.parametrize("sizes", [(64, 256, 256), (256, 64, 256)])
+def test_a_narrow_workgroup_axis_caps_the_thread_count(
+    sizes: tuple[int, int, int],
+) -> None:
+    """A tile spans two axes, so the smaller per-axis limit is the binding one.
+
+    Either axis alone can be the narrow one, so both are given a turn while the
+    other stays wide.
+    """
+    lib = _FakeVulkan(device_limits=(16384, 1024, 256), workgroup_sizes=sizes)
     with _open(lib) as ctx:
         assert ctx.tile_limits.max_threads_per_group == 64
 
 
 @pytest.mark.parametrize(
-    ("limits", "member"),
+    ("limits", "sizes", "member"),
     [
-        ((0, 256, 256), "maxComputeSharedMemorySize"),
-        ((16384, 0, 256), "maxComputeWorkGroupInvocations"),
-        ((16384, 256, 0), "maxComputeWorkGroupSize[0]"),
+        ((0, 256, 256), None, "maxComputeSharedMemorySize"),
+        ((16384, 0, 256), None, "maxComputeWorkGroupInvocations"),
+        ((16384, 256, 256), (0, 256, 256), "maxComputeWorkGroupSize[0]"),
+        ((16384, 256, 256), (256, 0, 256), "maxComputeWorkGroupSize[1]"),
     ],
 )
 def test_a_zero_compute_limit_is_refused(
-    limits: tuple[int, int, int], member: str
+    limits: tuple[int, int, int],
+    sizes: tuple[int, int, int] | None,
+    member: str,
 ) -> None:
     """No conforming driver reports zero, and no tile could satisfy it."""
-    lib = _FakeVulkan(device_limits=limits)
+    lib = _FakeVulkan(device_limits=limits, workgroup_sizes=sizes)
     with pytest.raises(vc.VulkanError, match=member.replace("[", r"\[")):
         _open(lib)
     assert lib.events == ["destroy-instance"]
