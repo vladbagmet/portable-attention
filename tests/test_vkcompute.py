@@ -36,6 +36,10 @@ _HOST_COHERENT = 0x2 | 0x4
 _DEVICE_LOCAL_COHERENT = 0x1 | 0x2 | 0x4
 
 _ONE_COMPUTE_DEVICE = (("V3D 7.1.7.0", (1 << 22) | (2 << 12) | 289, (_COMPUTE_QUEUE,)),)
+#: What V3D reports for ``maxComputeSharedMemorySize``,
+#: ``maxComputeWorkGroupInvocations`` and each axis of
+#: ``maxComputeWorkGroupSize``.
+_V3D_COMPUTE_LIMITS = (16384, 256, 256)
 
 
 class _FakeVulkan:
@@ -55,7 +59,9 @@ class _FakeVulkan:
         fail: dict[str, int] | None = None,
         map_null: bool = False,
         null_instance: bool = False,
+        device_limits: tuple[int, int, int] = _V3D_COMPUTE_LIMITS,
     ) -> None:
+        self.device_limits = device_limits
         self.devices = devices
         self.memory_types = memory_types
         self.memory_type_bits = memory_type_bits
@@ -104,6 +110,12 @@ class _FakeVulkan:
         name, api_version, _ = self.devices[device.value - 1]
         props.contents.deviceName = name.encode()
         props.contents.apiVersion = api_version
+        shared, invocations, per_axis = self.device_limits
+        limits = props.contents.limits
+        limits.maxComputeSharedMemorySize = shared
+        limits.maxComputeWorkGroupInvocations = invocations
+        for axis in range(3):
+            limits.maxComputeWorkGroupSize[axis] = per_axis
 
     def vkGetPhysicalDeviceQueueFamilyProperties(  # noqa: N802
         self, device: Any, count: Any, families: Any
@@ -493,6 +505,42 @@ def test_open_reports_device_identity() -> None:
         assert ctx.closed is False
     assert ctx.closed is True
     assert lib.events == ["destroy-device", "destroy-instance"]
+
+
+def test_open_reports_tile_limits_from_the_device() -> None:
+    """``VkPhysicalDeviceLimits`` arrives as the numbers tile sizing takes."""
+    lib = _FakeVulkan(device_limits=(32768, 1024, 1024))
+    with _open(lib) as ctx:
+        limits = ctx.tile_limits
+    assert limits.shared_memory_bytes == 32768
+    assert limits.max_threads_per_group == 1024
+    assert limits.simd_width == vc.SUBGROUP_WIDTH_FALLBACK
+    assert "V3D 7.1.7.0" in limits.name
+
+
+def test_a_narrow_workgroup_axis_caps_the_thread_count() -> None:
+    """A tile spans two axes, so the smaller per-axis limit is the binding one."""
+    lib = _FakeVulkan(device_limits=(16384, 1024, 64))
+    with _open(lib) as ctx:
+        assert ctx.tile_limits.max_threads_per_group == 64
+
+
+@pytest.mark.parametrize(
+    ("limits", "member"),
+    [
+        ((0, 256, 256), "maxComputeSharedMemorySize"),
+        ((16384, 0, 256), "maxComputeWorkGroupInvocations"),
+        ((16384, 256, 0), "maxComputeWorkGroupSize[0]"),
+    ],
+)
+def test_a_zero_compute_limit_is_refused(
+    limits: tuple[int, int, int], member: str
+) -> None:
+    """No conforming driver reports zero, and no tile could satisfy it."""
+    lib = _FakeVulkan(device_limits=limits)
+    with pytest.raises(vc.VulkanError, match=member.replace("[", r"\[")):
+        _open(lib)
+    assert lib.events == ["destroy-instance"]
 
 
 def test_open_skips_devices_without_compute() -> None:

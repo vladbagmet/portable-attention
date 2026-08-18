@@ -52,13 +52,23 @@ from ._vkffi import (
     find_loader_name,
     format_api_version,
 )
+from .tiling import DeviceLimits
 
 __all__ = [
+    "SUBGROUP_WIDTH_FALLBACK",
     "VulkanBuffer",
     "VulkanContext",
     "VulkanError",
     "VulkanPipeline",
 ]
+
+#: Subgroup width assumed when planning tiles. ``subgroupSize`` lives in
+#: ``VkPhysicalDeviceSubgroupProperties``, which needs the Vulkan 1.1
+#: ``vkGetPhysicalDeviceProperties2`` query rather than the 1.0 call this
+#: module makes, so it is not read yet. Tile sizing uses the width only to
+#: order equally-sized candidates by occupancy, never to decide whether a tile
+#: fits, and 16 is the narrowest width the targeted devices have.
+SUBGROUP_WIDTH_FALLBACK = 16
 
 _VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2
 _VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3
@@ -1238,7 +1248,9 @@ class VulkanContext:
         device_name: str,
         api_version: str,
         queue_family_index: int,
+        tile_limits: DeviceLimits,
     ) -> None:
+        self._tile_limits = tile_limits
         self._lib = lib
         self._instance = instance
         self._physical_device = physical_device
@@ -1283,6 +1295,8 @@ class VulkanContext:
             physical_device, properties = _select_physical_device(
                 lib, instance, device_index
             )
+            name = properties.deviceName.decode("utf-8", "replace")
+            tile_limits = _tile_limits_of(properties, name)
             queue_family_index = _compute_queue_family(lib, physical_device)
             device, queue = _create_device(lib, physical_device, queue_family_index)
         except BaseException:
@@ -1294,9 +1308,10 @@ class VulkanContext:
             physical_device,
             device,
             queue,
-            device_name=properties.deviceName.decode("utf-8", "replace"),
+            device_name=name,
             api_version=format_api_version(properties.apiVersion),
             queue_family_index=queue_family_index,
+            tile_limits=tile_limits,
         )
 
     @property
@@ -1313,6 +1328,16 @@ class VulkanContext:
     def queue_family_index(self) -> int:
         """Index of the queue family the compute queue was taken from."""
         return self._queue_family_index
+
+    @property
+    def tile_limits(self) -> DeviceLimits:
+        """What this device reports to :func:`~portable_attention.plan_tiles`.
+
+        Built from ``VkPhysicalDeviceLimits`` when the device was opened, so a
+        kernel is sized against the hardware in front of it instead of the
+        minimums the Vulkan specification guarantees everywhere.
+        """
+        return self._tile_limits
 
     @property
     def closed(self) -> bool:
@@ -1913,6 +1938,45 @@ def _device_properties(
     properties = VkPhysicalDeviceProperties()
     lib.vkGetPhysicalDeviceProperties(device, ctypes.pointer(properties))
     return properties
+
+
+def _tile_limits_of(
+    properties: VkPhysicalDeviceProperties, device_name: str
+) -> DeviceLimits:
+    """Translate ``VkPhysicalDeviceLimits`` into tile-sizing limits.
+
+    ``max_threads_per_group`` is the smallest of the total invocation limit and
+    the two workgroup axes the attention kernel spans. A tile whose invocation
+    count fits that single number has each of its two axes within the per-axis
+    limit as well, so one number carries all three constraints.
+
+    Raises:
+        VulkanError: When the driver reports a limit of zero, which no
+            conforming implementation may do and which no tile could satisfy.
+    """
+    limits = properties.limits
+    reported = {
+        "maxComputeSharedMemorySize": int(limits.maxComputeSharedMemorySize),
+        "maxComputeWorkGroupInvocations": int(limits.maxComputeWorkGroupInvocations),
+        "maxComputeWorkGroupSize[0]": int(limits.maxComputeWorkGroupSize[0]),
+        "maxComputeWorkGroupSize[1]": int(limits.maxComputeWorkGroupSize[1]),
+    }
+    for member, value in reported.items():
+        if value <= 0:
+            raise VulkanError(
+                f"device {device_name!r} reports {member} = {value}, "
+                "which is not a usable compute limit"
+            )
+    return DeviceLimits(
+        shared_memory_bytes=reported["maxComputeSharedMemorySize"],
+        max_threads_per_group=min(
+            reported["maxComputeWorkGroupInvocations"],
+            reported["maxComputeWorkGroupSize[0]"],
+            reported["maxComputeWorkGroupSize[1]"],
+        ),
+        simd_width=SUBGROUP_WIDTH_FALLBACK,
+        name=f"{device_name} (Vulkan)",
+    )
 
 
 def _has_compute_family(lib: ctypes.CDLL, device: ctypes.c_void_p) -> bool:

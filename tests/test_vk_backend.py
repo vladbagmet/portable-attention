@@ -21,7 +21,7 @@ import pytest
 from portable_attention import assert_conforms, available_backends, get_backend
 from portable_attention.dispatch import _REGISTRY
 from portable_attention.fused import scaled_dot_product_attention as fused_sdpa
-from portable_attention.tiling import V3D_LIMITS
+from portable_attention.tiling import V3D_LIMITS, DeviceLimits, plan_tiles
 from portable_attention.vkattention import BUFFER_COUNT, PUSH_CONSTANT_BYTES
 from portable_attention.vkbackend import (
     DISABLE_ENV_VAR,
@@ -215,10 +215,11 @@ class _FakePipeline:
 class _FakeContext:
     """Just enough of VulkanContext to drive the backend's device path."""
 
-    def __init__(self) -> None:
+    def __init__(self, tile_limits: DeviceLimits = V3D_LIMITS) -> None:
         self.buffers: list[_FakeBuffer] = []
         self.pipelines: list[_FakePipeline] = []
         self.closed = False
+        self.tile_limits = tile_limits
 
     def allocate(self, nbytes: int) -> _FakeBuffer:
         buffer = _FakeBuffer(nbytes)
@@ -242,6 +243,11 @@ class _FakeContext:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _threads_per_group(pipeline: _FakePipeline) -> int:
+    """Invocations the pipeline's workgroup holds (``local_size_x * _y``)."""
+    return pipeline.specialization[0] * pipeline.specialization[1]
 
 
 def _fake_backend(context: _FakeContext | None = None) -> tuple[VulkanAttention, Any]:
@@ -526,12 +532,82 @@ def test_auto_does_not_route_to_the_device() -> None:
     assert not isinstance(_auto_select(q), VulkanAttention)
 
 
-def test_the_default_limits_are_the_vulkan_minimums() -> None:
-    """Plans must fit any conformant device until limits can be queried."""
+# --------------------------------------------------------------------------
+# tile-sizing limits
+# --------------------------------------------------------------------------
+
+
+def test_the_limits_are_the_vulkan_minimums_until_a_device_is_open() -> None:
+    """Nothing has been asked yet, so the answer has to hold anywhere."""
     backend = VulkanAttention()
     assert backend.limits is VULKAN_FLOOR_LIMITS
     assert VULKAN_FLOOR_LIMITS.shared_memory_bytes <= V3D_LIMITS.shared_memory_bytes
     assert VULKAN_FLOOR_LIMITS.max_threads_per_group <= V3D_LIMITS.max_threads_per_group
+
+
+def test_the_open_device_supplies_the_limits() -> None:
+    """A device with room to spare gets tiles sized for it, not for the floor."""
+    roomy = DeviceLimits(
+        shared_memory_bytes=65536,
+        max_threads_per_group=1024,
+        simd_width=32,
+        name="roomy",
+    )
+    backend, ctx = _fake_backend(_FakeContext(tile_limits=roomy))
+
+    backend(*_inputs(seq_q=64, seq_k=64, head_dim=32))
+
+    assert backend.limits == roomy
+    floor_plan = plan_tiles(32, 4, VULKAN_FLOOR_LIMITS, seq_len_q=64, seq_len_k=64)
+    assert _threads_per_group(ctx.pipelines[0]) > floor_plan.threads_per_group
+
+
+def test_explicit_limits_outrank_the_device() -> None:
+    """Passing limits pins the tile shape whatever the device would allow."""
+    ctx = _FakeContext(
+        tile_limits=DeviceLimits(
+            shared_memory_bytes=65536,
+            max_threads_per_group=1024,
+            simd_width=32,
+            name="roomy",
+        )
+    )
+    backend = VulkanAttention(
+        limits=VULKAN_FLOOR_LIMITS,
+        open_context=lambda *, device_index: ctx,  # type: ignore[arg-type]
+    )
+
+    backend(*_inputs(seq_q=64, seq_k=64, head_dim=32))
+
+    assert backend.limits is VULKAN_FLOOR_LIMITS
+    floor_plan = plan_tiles(32, 4, VULKAN_FLOOR_LIMITS, seq_len_q=64, seq_len_k=64)
+    assert _threads_per_group(ctx.pipelines[0]) == floor_plan.threads_per_group
+
+    backend.close()
+    assert backend.limits is VULKAN_FLOOR_LIMITS
+
+
+def test_closing_forgets_what_the_device_reported() -> None:
+    """The next device may be a different one, so its limits are not inherited."""
+    backend, _ = _fake_backend()
+    backend(*_inputs())
+    assert backend.limits == V3D_LIMITS
+
+    backend.close()
+
+    assert backend.limits is VULKAN_FLOOR_LIMITS
+
+
+def test_a_head_dim_no_tile_fits_falls_back_without_a_dispatch() -> None:
+    """Whether a shape fits is the device's answer, and a miss stays silent."""
+    backend, ctx = _fake_backend()
+    q, k, v = _inputs(head_dim=4096)
+
+    got = backend(q, k, v)
+
+    np.testing.assert_allclose(got, fused_sdpa(q, k, v), rtol=1e-5, atol=1e-5)
+    assert backend.device_calls == 0
+    assert ctx.pipelines == []
 
 
 # --------------------------------------------------------------------------

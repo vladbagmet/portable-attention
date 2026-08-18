@@ -20,11 +20,11 @@ host leaves the registry exactly as it was. It is not part of ``"auto"``: until
 there are benchmark numbers saying when the device wins, selecting it is the
 caller's decision.
 
-Tile sizing uses :data:`VULKAN_FLOOR_LIMITS` — the minima every Vulkan
-implementation guarantees — because a context cannot yet report its device's
-own limits. That is conservative on hardware with more to give (V3D allows
-twice the workgroup size the floor does), and it is the number to replace once
-the limits query lands.
+Tiles are sized against the limits the opened device reports
+(``VkPhysicalDeviceLimits``), so the kernel uses what the hardware has rather
+than the minima the specification guarantees everywhere. Those minima remain as
+:data:`VULKAN_FLOOR_LIMITS`, which is what :attr:`VulkanAttention.limits`
+answers before a device has been opened.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from .vkattention import (
     BUFFER_COUNT,
     KERNEL_DTYPE_BYTES,
     PUSH_CONSTANT_BYTES,
+    AttentionLaunch,
     attention_launch,
     attention_spirv,
 )
@@ -70,10 +71,10 @@ DISABLE_ENV_VAR = "PORTABLE_ATTENTION_DISABLE_VULKAN"
 
 #: The tile-sizing limits every Vulkan implementation is required to meet:
 #: 16 KiB of workgroup-shared memory and 128 invocations per workgroup. A plan
-#: that fits these runs anywhere, which is the right default while the context
-#: cannot report a device's real ``maxCompute*`` values. ``simd_width`` only
-#: orders the policy's preferences, and 16 is the narrowest width the devices
-#: this project targets have.
+#: that fits these runs anywhere. It is what the backend reports before it has
+#: opened a device, and what a caller can pass as an override to hold a kernel
+#: to portable tile shapes. ``simd_width`` only orders the policy's
+#: preferences, and 16 is the narrowest width the targeted devices have.
 VULKAN_FLOOR_LIMITS = DeviceLimits(
     shared_memory_bytes=16384,
     max_threads_per_group=128,
@@ -163,7 +164,7 @@ class VulkanAttention:
     def __init__(
         self,
         *,
-        limits: DeviceLimits = VULKAN_FLOOR_LIMITS,
+        limits: DeviceLimits | None = None,
         device_index: int | None = None,
         open_context: _OpenContext = VulkanContext.open,
         fallback: SdpaBackend | None = None,
@@ -171,15 +172,18 @@ class VulkanAttention:
         """Build a backend; the device is opened lazily on the first call.
 
         Args:
-            limits: Device limits tile sizing plans against. Defaults to the
-                Vulkan minimums, which any device satisfies.
+            limits: Device limits tile sizing plans against, overriding what
+                the device reports. ``None`` (the default) asks the device
+                once it is open, and reports :data:`VULKAN_FLOOR_LIMITS` until
+                then.
             device_index: Index into the loader's device enumeration, or
                 ``None`` for the first compute-capable device.
             open_context: How to open the device. Injectable for tests.
             fallback: Backend for calls the kernel does not cover. Defaults to
                 the ``fused`` CPU backend.
         """
-        self._limits = limits
+        self._limits_override = limits
+        self._limits = VULKAN_FLOOR_LIMITS if limits is None else limits
         self._device_index = device_index
         self._open_context = open_context
         self._fallback: SdpaBackend = _fused_sdpa if fallback is None else fallback
@@ -192,7 +196,12 @@ class VulkanAttention:
 
     @property
     def limits(self) -> DeviceLimits:
-        """The device limits tile plans are sized against."""
+        """The device limits tile plans are sized against.
+
+        The Vulkan minimums until the device has been opened, then whatever it
+        reports — unless the caller passed limits of their own, which always
+        win.
+        """
         return self._limits
 
     @property
@@ -263,6 +272,8 @@ class VulkanAttention:
     def _close_held(self) -> None:
         """Release the device; the caller already holds the lock."""
         context, self._context = self._context, None
+        if self._limits_override is None:
+            self._limits = VULKAN_FLOOR_LIMITS
         self._pipelines.clear()
         self._buffers = [None] * BUFFER_COUNT
         if context is not None:
@@ -281,27 +292,6 @@ class VulkanAttention:
         head_dim = int(query.shape[-1])
         seq_q, seq_k = int(query.shape[-2]), int(key.shape[-2])
         stack = int(np.prod(query.shape[:-2])) if query.ndim > 2 else 1
-        try:
-            plan = plan_tiles(
-                head_dim,
-                KERNEL_DTYPE_BYTES,
-                self._limits,
-                seq_len_q=seq_q,
-                seq_len_k=seq_k,
-            )
-            launch = attention_launch(
-                plan,
-                stack=stack,
-                seq_q=seq_q,
-                seq_k=seq_k,
-                scale=float(1.0 / np.sqrt(head_dim)) if scale is None else scale,
-                is_causal=is_causal,
-            )
-        except (TileSizingError, ValueError):
-            # No tile shape fits this head dimension, or the dispatch would be
-            # wider than Vulkan guarantees. Both are shape facts, not faults.
-            return None
-
         flat_q = _as_stack(query, stack)
         flat_k = _as_stack(key, stack)
         flat_v = _as_stack(value, stack)
@@ -311,7 +301,25 @@ class VulkanAttention:
                     # A device that failed once is not tried again, and the
                     # flag is only ever read here, under the lock.
                     return None
+                # Whether a shape fits is a question about the device, so the
+                # device is opened before the plan is made, not after.
+                context = self._context_held()
+                try:
+                    launch = self._plan(
+                        head_dim,
+                        stack=stack,
+                        seq_q=seq_q,
+                        seq_k=seq_k,
+                        scale=scale,
+                        is_causal=is_causal,
+                    )
+                except (TileSizingError, ValueError):
+                    # No tile shape fits this head dimension on this device, or
+                    # the dispatch would be wider than Vulkan guarantees. Both
+                    # are shape facts, not faults.
+                    return None
                 flat_out = self._dispatch(
+                    context,
                     flat_q,
                     flat_k,
                     flat_v,
@@ -325,8 +333,51 @@ class VulkanAttention:
             return None
         return flat_out.reshape(*query.shape[:-2], seq_q, head_dim)
 
+    def _plan(
+        self,
+        head_dim: int,
+        *,
+        stack: int,
+        seq_q: int,
+        seq_k: int,
+        scale: float | None,
+        is_causal: bool,
+    ) -> AttentionLaunch:
+        """Size the tiles for this shape against the current device limits."""
+        plan = plan_tiles(
+            head_dim,
+            KERNEL_DTYPE_BYTES,
+            self._limits,
+            seq_len_q=seq_q,
+            seq_len_k=seq_k,
+        )
+        return attention_launch(
+            plan,
+            stack=stack,
+            seq_q=seq_q,
+            seq_k=seq_k,
+            scale=float(1.0 / np.sqrt(head_dim)) if scale is None else scale,
+            is_causal=is_causal,
+        )
+
+    def _context_held(self) -> VulkanContext:
+        """Return the open device, opening it on first use; lock held.
+
+        Opening is also where the tile-sizing limits stop being the Vulkan
+        minimums and become the ones this device reports, unless the caller
+        supplied limits of their own.
+        """
+        context = self._context
+        if context is None:
+            context = self._open_context(device_index=self._device_index)
+            self._context = context
+            if self._limits_override is None:
+                self._limits = context.tile_limits
+        return context
+
     def _dispatch(
         self,
+        context: VulkanContext,
         flat_q: NDArray[np.float32],
         flat_k: NDArray[np.float32],
         flat_v: NDArray[np.float32],
@@ -336,10 +387,6 @@ class VulkanAttention:
         groups: tuple[int, int, int],
     ) -> NDArray[np.float32]:
         """Copy in, run the pipeline for this tile shape, copy the output out."""
-        context = self._context
-        if context is None:
-            context = self._open_context(device_index=self._device_index)
-            self._context = context
         for binding, array in (
             (_QUERY, flat_q),
             (_KEY, flat_k),
