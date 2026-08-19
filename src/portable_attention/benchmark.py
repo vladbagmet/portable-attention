@@ -20,6 +20,13 @@ loaded in the process will not re-read it).
 Run it as a module to emit a Markdown block for ``BENCHMARKS.md``::
 
     python -m portable_attention.benchmark --threads 1 --commit abc1234
+
+Passing more than one backend measures the same shapes on each of them and
+prints a comparison table with speedups against the first one, which is how the
+cross-backend blocks in ``BENCHMARKS.md`` are produced::
+
+    python -m portable_attention.benchmark \\
+        --threads default --backends reference,fused,vulkan
 """
 
 from __future__ import annotations
@@ -49,7 +56,9 @@ __all__ = [
     "ThreadInfo",
     "benchmark_shape",
     "describe_threads",
+    "format_comparison",
     "format_markdown",
+    "run_comparison",
     "run_suite",
     "run_thread_sweep",
 ]
@@ -99,6 +108,7 @@ class BenchmarkResult:
     threads: int | None
     latency_ms: float
     repeats: int
+    backend: str = "reference"
 
     @property
     def thread_label(self) -> str:
@@ -249,7 +259,7 @@ def benchmark_shape(
         latency = _time_ms(
             lambda: fn(query, key, value), repeats=repeats, warmup=warmup
         )
-    return BenchmarkResult(shape, resolved.name, threads, latency, repeats)
+    return BenchmarkResult(shape, resolved.name, threads, latency, repeats, backend)
 
 
 def run_suite(
@@ -294,6 +304,44 @@ def run_thread_sweep(
     ]
 
 
+def run_comparison(
+    *,
+    backends: Sequence[str],
+    threads: int | None = None,
+    dtype: str = "float32",
+    repeats: int = 20,
+    shapes: Sequence[Shape] = DEFAULT_SHAPES,
+) -> list[BenchmarkResult]:
+    """Measure every shape on every backend at one thread setting.
+
+    Shapes are the outer loop so each backend meets a shape at roughly the same
+    machine state; the returned list is flat and carries the backend name on
+    every result, which is what :func:`format_comparison` groups by.
+
+    Args:
+        backends: Registered backend names. The first one is the baseline the
+            speedup columns are computed against.
+        threads: BLAS thread count pinned for every measurement, or ``None``
+            (the default) to measure the process default policy.
+        dtype: Floating dtype of the inputs.
+        repeats: Timed calls per measurement; the median is reported.
+        shapes: Shapes to measure.
+    """
+    if not backends:
+        raise ValueError("backends must name at least one backend")
+    return [
+        benchmark_shape(
+            shape,
+            threads=threads,
+            dtype=dtype,
+            repeats=repeats,
+            backend=backend,
+        )
+        for shape in shapes
+        for backend in backends
+    ]
+
+
 def _results_table(results: Sequence[BenchmarkResult]) -> str:
     header = (
         "| shape (B,H,S,D)   | dtype   | threads | latency (median) |\n"
@@ -307,6 +355,93 @@ def _results_table(results: Sequence[BenchmarkResult]) -> str:
     return "\n".join([header, *rows])
 
 
+def _markdown_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    right_aligned: Sequence[bool],
+) -> str:
+    """Render a padded Markdown table; ``right_aligned`` marks numeric columns."""
+    widths = [
+        max([len(headers[col]), *(len(row[col]) for row in rows)])
+        for col in range(len(headers))
+    ]
+
+    def line(cells: Sequence[str]) -> str:
+        parts = [
+            cell.rjust(widths[col]) if right_aligned[col] else cell.ljust(widths[col])
+            for col, cell in enumerate(cells)
+        ]
+        return "| " + " | ".join(parts) + " |"
+
+    rule = (
+        "|"
+        + "|".join(
+            "-" * (widths[col] + 1) + (":" if right_aligned[col] else "-")
+            for col in range(len(headers))
+        )
+        + "|"
+    )
+    return "\n".join([line(headers), rule, *(line(row) for row in rows)])
+
+
+def _speedup(baseline_ms: float | None, candidate_ms: float | None) -> str:
+    """Format ``baseline / candidate`` as a speedup, or ``n/a`` if unusable."""
+    if baseline_ms is None or candidate_ms is None or candidate_ms <= 0.0:
+        return "n/a"
+    return f"{baseline_ms / candidate_ms:.2f}x"
+
+
+def format_comparison(
+    results: Sequence[BenchmarkResult],
+    *,
+    baseline: str | None = None,
+) -> str:
+    """Render one row per shape with a latency column for each backend.
+
+    Every non-baseline backend also gets a speedup column against the baseline
+    (the first backend measured unless ``baseline`` names another one). Missing
+    measurements are printed as ``n/a`` rather than dropped, so a backend that
+    could not run a shape stays visible in the table.
+
+    Args:
+        results: Measurements from :func:`run_comparison` (or any list of
+            results carrying backend names).
+        baseline: Backend the speedups are relative to.
+    """
+    if not results:
+        return "_no measurements_"
+    names: list[str] = []
+    for result in results:
+        if result.backend not in names:
+            names.append(result.backend)
+    reference_name = names[0] if baseline is None else baseline
+    if reference_name not in names:
+        raise ValueError(f"baseline {reference_name!r} was not measured; have {names}")
+    grouped: dict[tuple[Shape, str, str], dict[str, float]] = {}
+    for result in results:
+        key = (result.shape, result.dtype, result.thread_label)
+        grouped.setdefault(key, {})[result.backend] = result.latency_ms
+    others = [name for name in names if name != reference_name]
+    headers = [
+        "shape (B,H,S,D)",
+        "dtype",
+        "threads",
+        *names,
+        *(f"{name} vs {reference_name}" for name in others),
+    ]
+    right_aligned = [False, False, False, *(True for _ in headers[3:])]
+    rows: list[list[str]] = []
+    for (shape, dtype, thread_label), latencies in grouped.items():
+        base = latencies.get(reference_name)
+        cells = [str(tuple(shape)), dtype, thread_label]
+        for name in names:
+            measured = latencies.get(name)
+            cells.append("n/a" if measured is None else f"{measured:.3f} ms")
+        cells.extend(_speedup(base, latencies.get(name)) for name in others)
+        rows.append(cells)
+    return _markdown_table(headers, rows, right_aligned)
+
+
 def format_markdown(
     results: Sequence[BenchmarkResult],
     sweep: Sequence[BenchmarkResult],
@@ -316,19 +451,16 @@ def format_markdown(
     timestamp: datetime | None = None,
 ) -> str:
     """Render a dated Markdown block ready to append to ``BENCHMARKS.md``."""
-    when = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-    commit_label = commit or "unknown"
     lines = [
-        f"## {when} — commit {commit_label}",
-        "",
-        f"**Environment:** {platform.machine()}, "
-        f"{os.cpu_count()} CPUs. Python {platform.python_version()}, "
-        f"NumPy {np.__version__}. portable-attention {__version__}.",
-        "",
-        f"**BLAS threads (process default, via {thread_info.source}):** "
-        f"{thread_info.summary}. Each row below is measured with the thread "
-        f"count pinned to its `threads` value.",
-        "",
+        *_report_header(
+            thread_info,
+            commit=commit,
+            timestamp=timestamp,
+            threads_note=(
+                "Each row below is measured with the thread count pinned to "
+                "its `threads` value."
+            ),
+        ),
         "### Latency by shape (pinned threads, median over repeats)",
         "",
         _results_table(results),
@@ -340,16 +472,74 @@ def format_markdown(
     return "\n".join(lines)
 
 
+def _report_header(
+    thread_info: ThreadInfo,
+    *,
+    commit: str | None,
+    timestamp: datetime | None,
+    threads_note: str,
+) -> list[str]:
+    """The dated heading, environment line and thread line shared by blocks."""
+    when = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    return [
+        f"## {when} — commit {commit or 'unknown'}",
+        "",
+        f"**Environment:** {platform.machine()}, "
+        f"{os.cpu_count()} CPUs. Python {platform.python_version()}, "
+        f"NumPy {np.__version__}. portable-attention {__version__}.",
+        "",
+        f"**BLAS threads (process default, via {thread_info.source}):** "
+        f"{thread_info.summary}. {threads_note}",
+        "",
+    ]
+
+
+def _parse_threads(value: str) -> int | None:
+    """Parse a ``--threads`` argument: an integer, or ``default`` for unpinned."""
+    if value.strip().lower() == "default":
+        return None
+    try:
+        threads = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a thread count or 'default', got {value!r}"
+        ) from None
+    if threads < 1:
+        raise argparse.ArgumentTypeError(f"thread count must be >= 1, got {threads}")
+    return threads
+
+
+def _parse_backends(value: str) -> list[str]:
+    """Parse a comma-separated backend list, preserving order."""
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("expected at least one backend name")
+    return names
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m portable_attention.benchmark",
-        description="Measure reference SDPA latency with pinned BLAS threads.",
+        description="Measure SDPA latency with a recorded BLAS thread policy.",
+    )
+    parser.add_argument(
+        "--backends",
+        type=_parse_backends,
+        default=["reference"],
+        help=(
+            "Comma-separated backend names. One backend prints the pinned "
+            "suite plus a thread sweep; several print a comparison table with "
+            "speedups against the first (default: reference)."
+        ),
     )
     parser.add_argument(
         "--threads",
-        type=int,
+        type=_parse_threads,
         default=1,
-        help="BLAS thread count to pin for the suite (default: 1).",
+        help=(
+            "BLAS thread count to pin for every measurement, or 'default' to "
+            "measure the process default policy (default: 1)."
+        ),
     )
     parser.add_argument(
         "--repeats",
@@ -368,12 +558,36 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point: print a dated Markdown benchmark block to stdout."""
     args = _build_parser().parse_args(argv)
-    threads: int = args.threads
+    threads: int | None = args.threads
     repeats: int = args.repeats
     commit: str | None = args.commit
-    results = run_suite(threads=threads, repeats=repeats)
-    sweep = run_thread_sweep(repeats=repeats)
-    print(format_markdown(results, sweep, describe_threads(), commit=commit))
+    backends: list[str] = args.backends
+    thread_info = describe_threads()
+    if len(backends) == 1:
+        results = run_suite(threads=threads, repeats=repeats, backend=backends[0])
+        sweep = run_thread_sweep(repeats=repeats, backend=backends[0])
+        print(format_markdown(results, sweep, thread_info, commit=commit))
+        return 0
+    comparison = run_comparison(backends=backends, threads=threads, repeats=repeats)
+    label = "the process default" if threads is None else f"{threads}"
+    print(
+        "\n".join(
+            [
+                *_report_header(
+                    thread_info,
+                    commit=commit,
+                    timestamp=None,
+                    threads_note=(
+                        f"Every row below is measured at {label} thread "
+                        f"count, median over {repeats} repeats."
+                    ),
+                ),
+                f"### Backend comparison (baseline: `{backends[0]}`)",
+                "",
+                format_comparison(comparison),
+            ]
+        )
+    )
     return 0
 
 
