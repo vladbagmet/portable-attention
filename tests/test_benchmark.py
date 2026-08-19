@@ -293,6 +293,11 @@ def test_run_comparison_requires_a_backend():
         run_comparison(backends=(), repeats=1)
 
 
+def test_run_comparison_rejects_duplicate_backends():
+    with pytest.raises(ValueError, match="unique"):
+        run_comparison(backends=("fused", "fused"), repeats=1)
+
+
 def test_benchmark_result_records_its_backend():
     result = benchmark_shape(TINY, threads=1, repeats=2, warmup=0, backend="fused")
     assert result.backend == "fused"
@@ -352,6 +357,12 @@ def test_format_comparison_marks_missing_and_degenerate_measurements():
     assert first.count("n/a") == 2  # missing latency and its speedup
     assert "0.000 ms" in second
     assert second.endswith("n/a |")
+
+
+def test_format_comparison_needs_a_positive_baseline():
+    # A zero baseline has no meaningful ratio against it either way.
+    md = format_comparison([_row("reference", 0.0), _row("fused", 5.0)])
+    assert md.splitlines()[2].endswith("n/a |")
 
 
 def test_format_comparison_without_measurements():

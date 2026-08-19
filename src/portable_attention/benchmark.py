@@ -319,8 +319,8 @@ def run_comparison(
     every result, which is what :func:`format_comparison` groups by.
 
     Args:
-        backends: Registered backend names. The first one is the baseline the
-            speedup columns are computed against.
+        backends: Distinct registered backend names. The first one is the
+            baseline the speedup columns are computed against.
         threads: BLAS thread count pinned for every measurement, or ``None``
             (the default) to measure the process default policy.
         dtype: Floating dtype of the inputs.
@@ -329,6 +329,8 @@ def run_comparison(
     """
     if not backends:
         raise ValueError("backends must name at least one backend")
+    if len(set(backends)) != len(backends):
+        raise ValueError(f"backends must be unique, got {list(backends)}")
     return [
         benchmark_shape(
             shape,
@@ -386,7 +388,9 @@ def _markdown_table(
 
 def _speedup(baseline_ms: float | None, candidate_ms: float | None) -> str:
     """Format ``baseline / candidate`` as a speedup, or ``n/a`` if unusable."""
-    if baseline_ms is None or candidate_ms is None or candidate_ms <= 0.0:
+    if baseline_ms is None or candidate_ms is None:
+        return "n/a"
+    if baseline_ms <= 0.0 or candidate_ms <= 0.0:
         return "n/a"
     return f"{baseline_ms / candidate_ms:.2f}x"
 
