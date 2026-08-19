@@ -7,6 +7,7 @@ without asserting on wall-clock numbers (which are machine-dependent).
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import os
 from collections.abc import Iterator
@@ -22,7 +23,9 @@ from portable_attention.benchmark import (
     ThreadInfo,
     benchmark_shape,
     describe_threads,
+    format_comparison,
     format_markdown,
+    run_comparison,
     run_suite,
     run_thread_sweep,
 )
@@ -254,3 +257,199 @@ def test_main_prints_markdown(capsys: pytest.CaptureFixture[str]):
     out = capsys.readouterr().out
     assert "commit deadbee" in out
     assert "Latency by shape" in out
+
+
+# --- cross-backend comparison ---------------------------------------------
+
+
+def _row(
+    backend: str,
+    latency: float,
+    *,
+    shape: tuple[int, int, int, int] = TINY,
+    threads: int | None = None,
+) -> BenchmarkResult:
+    return BenchmarkResult(shape, "float32", threads, latency, 5, backend)
+
+
+def test_run_comparison_measures_every_backend_on_every_shape():
+    results = run_comparison(
+        backends=("reference", "fused"),
+        shapes=(TINY, (1, 2, 8, 4)),
+        repeats=2,
+        threads=1,
+    )
+    assert [(r.shape, r.backend) for r in results] == [
+        (TINY, "reference"),
+        (TINY, "fused"),
+        ((1, 2, 8, 4), "reference"),
+        ((1, 2, 8, 4), "fused"),
+    ]
+    assert all(r.threads == 1 for r in results)
+
+
+def test_run_comparison_requires_a_backend():
+    with pytest.raises(ValueError, match="at least one backend"):
+        run_comparison(backends=(), repeats=1)
+
+
+def test_run_comparison_rejects_duplicate_backends():
+    with pytest.raises(ValueError, match="unique"):
+        run_comparison(backends=("fused", "fused"), repeats=1)
+
+
+def test_benchmark_result_records_its_backend():
+    result = benchmark_shape(TINY, threads=1, repeats=2, warmup=0, backend="fused")
+    assert result.backend == "fused"
+
+
+def test_format_comparison_tabulates_latencies_and_speedups():
+    md = format_comparison([_row("reference", 10.0), _row("fused", 4.0)])
+    header, rule, row = md.splitlines()
+    assert header.startswith("| shape (B,H,S,D) | dtype   | threads |")
+    assert "fused vs reference" in header
+    assert rule.endswith(":|")  # numeric columns are right-aligned
+    assert "10.000 ms" in row and "4.000 ms" in row
+    assert "2.50x" in row
+    assert "default" in row
+
+
+def test_format_comparison_groups_rows_by_shape():
+    other: tuple[int, int, int, int] = (1, 2, 8, 4)
+    md = format_comparison(
+        [
+            _row("reference", 10.0),
+            _row("fused", 5.0),
+            _row("reference", 20.0, shape=other),
+            _row("fused", 20.0, shape=other),
+        ]
+    )
+    body = md.splitlines()[2:]
+    assert len(body) == 2
+    assert "2.00x" in body[0]
+    assert "1.00x" in body[1]
+
+
+def test_format_comparison_honours_an_explicit_baseline():
+    md = format_comparison(
+        [_row("reference", 10.0), _row("fused", 5.0)], baseline="fused"
+    )
+    assert "reference vs fused" in md
+    assert "0.50x" in md
+
+
+def test_format_comparison_rejects_an_unmeasured_baseline():
+    with pytest.raises(ValueError, match="was not measured"):
+        format_comparison([_row("fused", 5.0)], baseline="vulkan")
+
+
+def test_format_comparison_marks_missing_and_degenerate_measurements():
+    # "vulkan" only ran the second shape, and a zero median is not a speedup.
+    other: tuple[int, int, int, int] = (1, 2, 8, 4)
+    md = format_comparison(
+        [
+            _row("reference", 10.0),
+            _row("vulkan", 0.0, shape=other),
+            _row("reference", 10.0, shape=other),
+        ]
+    )
+    first, second = md.splitlines()[2:]
+    assert first.count("n/a") == 2  # missing latency and its speedup
+    assert "0.000 ms" in second
+    assert second.endswith("n/a |")
+
+
+def test_format_comparison_needs_a_positive_baseline():
+    # A zero baseline has no meaningful ratio against it either way.
+    md = format_comparison([_row("reference", 0.0), _row("fused", 5.0)])
+    assert md.splitlines()[2].endswith("n/a |")
+
+
+def test_format_comparison_without_measurements():
+    assert format_comparison([]) == "_no measurements_"
+
+
+# --- argument parsing -----------------------------------------------------
+
+
+def test_parse_threads_accepts_default_and_counts():
+    assert benchmark._parse_threads("default") is None
+    assert benchmark._parse_threads(" DEFAULT ") is None
+    assert benchmark._parse_threads("4") == 4
+
+
+@pytest.mark.parametrize("bad", ["", "two", "0", "-1"])
+def test_parse_threads_rejects_junk(bad: str):
+    with pytest.raises(argparse.ArgumentTypeError):
+        benchmark._parse_threads(bad)
+
+
+def test_parse_backends_splits_and_trims():
+    assert benchmark._parse_backends("reference, fused ,vulkan") == [
+        "reference",
+        "fused",
+        "vulkan",
+    ]
+
+
+def test_parse_backends_rejects_empty():
+    with pytest.raises(argparse.ArgumentTypeError, match="at least one"):
+        benchmark._parse_backends(" , ")
+
+
+def _stub_measurements(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the timer so the CLI tests assert on formatting, not hardware."""
+    latencies = {"reference": 8.0, "fused": 2.0}
+
+    def fake(
+        shape: tuple[int, int, int, int],
+        *,
+        threads: int | None = None,
+        dtype: str = "float32",
+        repeats: int = 20,
+        warmup: int = 3,
+        backend: str = "reference",
+        seed: int = 0,
+    ) -> BenchmarkResult:
+        return BenchmarkResult(
+            shape, dtype, threads, latencies[backend], repeats, backend
+        )
+
+    monkeypatch.setattr(benchmark, "benchmark_shape", fake)
+
+
+def test_main_compares_backends(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    _stub_measurements(monkeypatch)
+    rc = benchmark.main(
+        [
+            "--backends",
+            "reference,fused",
+            "--threads",
+            "default",
+            "--repeats",
+            "1",
+            "--commit",
+            "c0ffee1",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "commit c0ffee1" in out
+    assert "Backend comparison (baseline: `reference`)" in out
+    assert "fused vs reference" in out
+    assert "4.00x" in out
+    assert "measured at the process default thread count" in out
+    assert out.count("float32") == len(DEFAULT_SHAPES)
+
+
+def test_main_pinned_comparison_reports_the_thread_count(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    _stub_measurements(monkeypatch)
+    rc = benchmark.main(
+        ["--backends", "reference,fused", "--threads", "1", "--repeats", "1"]
+    )
+    assert rc == 0
+    assert "measured at 1 thread count" in capsys.readouterr().out

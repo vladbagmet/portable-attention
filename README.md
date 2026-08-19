@@ -313,8 +313,11 @@ device fails mid-run
 the backend warns once and serves the rest of the process from the CPU: a
 wedged GPU costs throughput, not correctness.
 
-`"auto"` does not route to the device yet — that selection needs benchmark
-numbers, so for now the device is opt-in through `get_backend("vulkan")`.
+`"auto"` does not route to the device, and on the measured hardware it should
+not: on a V3D 7.1.7.0 integrated GPU the kernel is 5–7× slower than the `fused`
+CPU backend across the benchmark shapes (`BENCHMARKS.md`, 2026-08-19), because
+16 KiB of shared memory caps the tile at 16×16 while the CPU path hands whole
+GEMMs to a tuned BLAS. The device is opt-in through `get_backend("vulkan")`.
 Setting `PORTABLE_ATTENTION_DISABLE_VULKAN` to any non-empty value skips both
 the detection probe and the registration.
 
@@ -373,6 +376,15 @@ harness:
 
 ```sh
 python -m portable_attention.benchmark --threads 1 --commit "$(git rev-parse --short HEAD)"
+```
+
+Pass several backends to measure the same shapes on each of them and get a
+comparison table with speedups against the first; `--threads default` leaves the
+process thread policy alone, which is what a caller actually gets:
+
+```sh
+python -m portable_attention.benchmark --backends reference,fused,vulkan \
+    --threads default
 ```
 
 Installing `threadpoolctl` lets the harness detect and pin the real BLAS thread
