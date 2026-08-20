@@ -41,6 +41,35 @@ you update the pin, run `ruff format .` and commit the result together with the
 bump. Re-run `uv pip install -e ".[dev]"` after pulling a change to the pin so
 your venv follows.
 
+## Running the Vulkan tests
+
+The Vulkan device tests skip themselves where the loader finds no
+compute-capable device, so a machine without a GPU still runs the rest of the
+suite. To run them:
+
+```sh
+./scripts/vulkan-conformance.sh
+```
+
+It reports the devices the loader enumerated and the tile limits of the one it
+opened, exits non-zero when there is none — a skipped device test is not a
+pass — and then runs the Vulkan test modules. Any arguments you pass go to
+pytest instead of the default module list.
+
+CI runs that script against Mesa's `lavapipe` (`mesa-vulkan-drivers`), a
+software Vulkan 1.3 implementation, so the shader, the dispatch path and the
+conformance kit are checked on every pull request without a GPU runner. It is a
+correctness target only; benchmark numbers come from real devices. Where
+several drivers are installed, choose one with `VK_DRIVER_FILES`
+(`VK_ICD_FILENAMES` on loaders older than 1.3.207), naming a file from
+`/usr/share/vulkan/icd.d/` — distributions differ on whether the name carries
+an architecture suffix:
+
+```sh
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  ./scripts/vulkan-conformance.sh
+```
+
 ## Verifying the Metal backend
 
 No CI runner the project controls has an Apple GPU, so Metal changes cannot be

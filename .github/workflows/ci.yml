@@ -62,6 +62,29 @@ jobs:
           uv run coverage run -m pytest
           uv run coverage report
 
+  vulkan:
+    name: vulkan (llvmpipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Mesa's software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Create venv and install
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+      # Hosted runners have no GPU, so lavapipe is the only driver of the set
+      # that enumerates a device. The script reports which one it opened, and
+      # fails when that is none of them.
+      - name: Vulkan conformance
+        run: ./scripts/vulkan-conformance.sh
+
   build:
     name: build (sdist + wheel)
     runs-on: ubuntu-latest
