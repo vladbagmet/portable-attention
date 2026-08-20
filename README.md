@@ -321,6 +321,12 @@ GEMMs to a tuned BLAS. The device is opt-in through `get_backend("vulkan")`.
 Setting `PORTABLE_ATTENTION_DISABLE_VULKAN` to any non-empty value skips both
 the detection probe and the registration.
 
+CI has no GPU, so the device path is gated there on Mesa's `lavapipe` software
+rasteriser, which implements Vulkan 1.3 on the CPU: every pull request compiles
+the pipeline, dispatches the shader and runs the conformance kit through it.
+`scripts/vulkan-conformance.sh` is the same entry point locally and refuses to
+pass when the loader turns up no compute device (see CONTRIBUTING.md).
+
 ### Conformance kit
 
 The portability promise is *developer parity*: code written against

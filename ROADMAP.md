@@ -59,6 +59,8 @@ reproducible benchmark harness.
   conformance kit.
 - **llvmpipe as the CI Vulkan target** — software Vulkan 1.3 needs no GPU, so
   hosted runners can execute the conformance kit on the Vulkan backend.
+  *(done: `scripts/vulkan-conformance.sh`, run by the `vulkan (llvmpipe)` CI
+  job)*
 - Dated Vulkan numbers appended to `BENCHMARKS.md` alongside the CPU backends.
 - Optional autograd hook (backward pass) so the layer becomes training-usable on
   the Vulkan path.
