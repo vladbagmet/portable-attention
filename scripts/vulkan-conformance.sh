@@ -10,10 +10,11 @@
 #   ./scripts/vulkan-conformance.sh tests -q        # or any pytest arguments
 #
 # Point the loader at one driver with VK_DRIVER_FILES (VK_ICD_FILENAMES on
-# loaders older than 1.3.207) to choose between several installed ICDs, e.g.
-# Mesa's software rasteriser:
+# loaders older than 1.3.207) to choose between several installed ICDs, naming
+# a file from /usr/share/vulkan/icd.d/ — the exact name is the distribution's,
+# e.g. lvp_icd.json or lvp_icd.x86_64.json for Mesa's software rasteriser:
 #
-#   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+#   VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
 #     ./scripts/vulkan-conformance.sh
 set -euo pipefail
 

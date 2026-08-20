@@ -61,10 +61,12 @@ software Vulkan 1.3 implementation, so the shader, the dispatch path and the
 conformance kit are checked on every pull request without a GPU runner. It is a
 correctness target only; benchmark numbers come from real devices. Where
 several drivers are installed, choose one with `VK_DRIVER_FILES`
-(`VK_ICD_FILENAMES` on loaders older than 1.3.207):
+(`VK_ICD_FILENAMES` on loaders older than 1.3.207), naming a file from
+`/usr/share/vulkan/icd.d/` — distributions differ on whether the name carries
+an architecture suffix:
 
 ```sh
-VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   ./scripts/vulkan-conformance.sh
 ```
 
