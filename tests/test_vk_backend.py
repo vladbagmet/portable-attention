@@ -729,9 +729,10 @@ def test_a_forced_shape_that_does_not_fit_falls_back_to_the_cpu() -> None:
 
 @pytest.mark.parametrize(
     "tile_shape",
-    [(16,), (4, 8, 16), (0, 16), (4, -8), (4.0, 16), (True, 16)],
+    [(16,), (4, 8, 16), (0, 16), (4, -8), (4.0, 16), (True, 16), (3, 16), (8, 12)],
 )
 def test_a_malformed_tile_shape_is_rejected_at_construction(tile_shape: Any) -> None:
+    """A shape the policy could never produce fails loudly, not by falling back."""
     with pytest.raises(ValueError, match="tile_shape"):
         VulkanAttention(tile_shape=tile_shape)
 

@@ -510,9 +510,17 @@ def _is_pair(value: object) -> bool:
 
 
 def _block_size(name: str, block: object) -> int:
-    """Return ``block`` as a positive block size, rejecting anything else."""
+    """Return ``block`` as a positive block size, rejecting anything else.
+
+    Tile sizing only ever deals in powers of two, so a shape like ``(3, 16)``
+    is refused here rather than in :func:`~portable_attention.tile_plan_for`,
+    where it would read as "does not fit this device" and turn into a silent
+    CPU fallback on every call.
+    """
     if isinstance(block, bool) or not isinstance(block, int) or block <= 0:
         raise ValueError(f"tile_shape {name} must be a positive integer, got {block!r}")
+    if block & (block - 1):
+        raise ValueError(f"tile_shape {name} must be a power of two, got {block}")
     return block
 
 

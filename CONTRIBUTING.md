@@ -79,9 +79,9 @@ device at several `block_q x block_k` shapes and prints a Markdown table:
 python scripts/tile-sweep.py --tiles 16x16,32x8,8x16 --repeats 8
 ```
 
-It registers one backend per tile shape and reports the device call count for
-each, so a shape that silently fell back to the CPU is visible instead of
-turning up as a suspiciously good latency.
+It registers one backend per tile shape and counts device calls per benchmark
+shape, so a tile that fell back to the CPU on one row shows up as a non-zero
+exit naming that row instead of a suspiciously good latency.
 
 ## Verifying the Metal backend
 
