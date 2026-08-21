@@ -42,6 +42,7 @@ def test_public_exports_are_frozen():
         "assert_conforms",
         "available_backends",
         "blocked_attention",
+        "candidate_plans",
         "check_backend",
         "conformance_cases",
         "detect_vulkan",
@@ -51,6 +52,7 @@ def test_public_exports_are_frozen():
         "register_vulkan_backend",
         "scaled_dot_product_attention",
         "shared_memory_bytes_for",
+        "tile_plan_for",
         "vulkan_available",
     }
 

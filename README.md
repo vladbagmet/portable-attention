@@ -262,6 +262,12 @@ sides bill the same budget. The output accumulator is not in that budget — it 
 register-resident, `plan.accumulators_per_invocation` values per invocation. The
 Vulkan backend plans every dispatch through it.
 
+The preference order is a hypothesis about hardware, so the feasible set is
+public too: `candidate_plans(...)` returns every legal tile shape for a device,
+best first, and `tile_plan_for(block_q, block_k, ...)` builds one named shape or
+says which limit it misses. Tuning measures those; the policy stays a single
+function.
+
 ### The blocked algorithm, written down
 
 A device kernel that returns a wrong number does not say whether tiling,
@@ -308,7 +314,10 @@ pipeline per tile shape and four buffers (which grow with the shapes they see)
 are reused across calls. Tiles are planned against the limits the open device
 reports, so a part with room to spare gets larger tiles than the Vulkan
 minimums would allow; `VulkanAttention(limits=...)` pins them instead, and
-`backend.limits` answers the minimums until a device has been opened. If the
+`backend.limits` answers the minimums until a device has been opened.
+`VulkanAttention(tile_shape=(block_q, block_k))` goes one step further and
+compiles every dispatch for one named shape, which is what
+`scripts/tile-sweep.py` uses to time the kernel across tile shapes. If the
 device fails mid-run
 the backend warns once and serves the rest of the process from the CPU: a
 wedged GPU costs throughput, not correctness.
@@ -317,7 +326,11 @@ wedged GPU costs throughput, not correctness.
 not: on a V3D 7.1.7.0 integrated GPU the kernel is 5–7× slower than the `fused`
 CPU backend across the benchmark shapes (`BENCHMARKS.md`, 2026-08-19), because
 16 KiB of shared memory caps the tile at 16×16 while the CPU path hands whole
-GEMMs to a tuned BLAS. The device is opt-in through `get_backend("vulkan")`.
+GEMMs to a tuned BLAS. Sweeping the tile shape does not close that gap: latency
+tracks invocations per workgroup, and shapes with the same workgroup size land
+within a few percent of each other regardless of how wide the key tile is
+(`BENCHMARKS.md`, 2026-08-21). The device is opt-in through
+`get_backend("vulkan")`.
 Setting `PORTABLE_ATTENTION_DISABLE_VULKAN` to any non-empty value skips both
 the detection probe and the registration.
 

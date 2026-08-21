@@ -62,6 +62,9 @@ reproducible benchmark harness.
   *(done: `scripts/vulkan-conformance.sh`, run by the `vulkan (llvmpipe)` CI
   job)*
 - Dated Vulkan numbers appended to `BENCHMARKS.md` alongside the CPU backends.
+  *(done: 2026-08-19 comparison, 2026-08-21 tile-shape sweep via
+  `scripts/tile-sweep.py` — the device path is occupancy-bound, not
+  tile-reuse-bound)*
 - Optional autograd hook (backward pass) so the layer becomes training-usable on
   the Vulkan path.
 

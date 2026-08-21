@@ -43,6 +43,58 @@ Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 
 ---
 
+## 2026-08-21 — commit ec40b37 — Vulkan tile-shape sweep
+
+**Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention
+0.0.1. `threadpoolctl` 3.6.0.
+
+**BLAS threads (process default, via threadpoolctl):** openblas=4 — no pinning,
+so `fused` is the same column as in the block below.
+
+**Device:** `V3D 7.1.7.0` (Vulkan 1.2.289), integrated GPU, 16 KiB of shared
+memory and 256 invocations per workgroup. Every tile shape below fits those
+limits at both head dimensions measured, and each backend reported 44 device
+calls afterwards (11 calls × 4 shapes), so nothing fell back to the CPU.
+Generated with:
+
+```sh
+python scripts/tile-sweep.py --repeats 8 \
+  --tiles 16x16,32x8,8x16,16x8,4x16,8x8,2x16,1x16
+```
+
+### Latency by tile shape (median over 8 repeats)
+
+| shape (B,H,S,D)  | dtype   | threads |     fused |   vk 16x16 |    vk 32x8 |    vk 8x16 |    vk 16x8 |     vk 4x16 |      vk 8x8 |     vk 2x16 |     vk 1x16 | vk 16x16 vs fused | vk 32x8 vs fused | vk 8x16 vs fused | vk 16x8 vs fused | vk 4x16 vs fused | vk 8x8 vs fused | vk 2x16 vs fused | vk 1x16 vs fused |
+|------------------|---------|---------|----------:|-----------:|-----------:|-----------:|-----------:|------------:|------------:|------------:|------------:|------------------:|-----------------:|-----------------:|-----------------:|-----------------:|----------------:|-----------------:|-----------------:|
+| (1, 1, 64, 32)   | float32 | default |  0.126 ms |   0.507 ms |   0.486 ms |   0.600 ms |   0.580 ms |    1.041 ms |    0.989 ms |    2.291 ms |    6.277 ms |             0.25x |            0.26x |            0.21x |            0.22x |            0.12x |           0.13x |            0.05x |            0.02x |
+| (1, 8, 128, 64)  | float32 | default |  3.469 ms |  17.267 ms |  16.953 ms |  22.997 ms |  22.411 ms |   49.658 ms |   45.377 ms |  122.566 ms |  376.143 ms |             0.20x |            0.20x |            0.15x |            0.15x |            0.07x |           0.08x |            0.03x |            0.01x |
+| (2, 8, 256, 64)  | float32 | default | 25.737 ms | 134.255 ms | 132.162 ms | 179.795 ms | 169.427 ms |  399.882 ms |  359.122 ms |  989.901 ms | 2987.498 ms |             0.19x |            0.19x |            0.14x |            0.15x |            0.06x |           0.07x |            0.03x |            0.01x |
+| (1, 12, 512, 64) | float32 | default | 74.497 ms | 403.180 ms | 394.369 ms | 544.574 ms | 510.643 ms | 1223.661 ms | 1093.718 ms | 2990.785 ms | 9130.452 ms |             0.18x |            0.19x |            0.14x |            0.15x |            0.06x |           0.07x |            0.02x |            0.01x |
+
+**Workgroup size decides; key-tile width barely registers.** Sorting the shapes
+by invocations per workgroup reproduces the latency order exactly: 256
+invocations (16×16, 32×8) is the floor, 128 costs ~1.3×, 64 ~2.9×, 32 ~7.4× and
+16 ~22.6× on `(1, 12, 512, 64)`. Within one workgroup size the two shapes land
+within 2–6% of each other — 32×8 edges 16×16 by 2%, 16×8 edges 8×16 by 6% — which
+is around run-to-run spread, and in both pairs the *narrower* key tile is the
+faster one.
+
+So the 5–7× gap against `fused` recorded on 2026-08-19 is not tile-reuse-bound:
+if reloading K/V tiles were what costs, the widest key tile would win by more
+than noise and the narrow ones would collapse. What actually collapses is
+occupancy. The best shape measured here is still 5.4× slower than `fused` on
+`(1, 12, 512, 64)`, so no tile choice rescues the device path on this part; a
+faster V3D kernel would have to change what an invocation does, not how the
+tiles are cut.
+
+The sizing policy's first preference (largest workgroup) is therefore confirmed
+on real hardware. Its second (widest key tile) is not: it is within noise here
+and slightly against on this device. It stays as the tie-break — it bounds
+`accumulators_per_invocation`, which matters on parts with a smaller register
+budget — but it is a tie-break with no measured benefit on V3D.
+
+---
+
 ## 2026-08-19 — commit c6d6ad5 — the Vulkan device path against the CPU backends
 
 **Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention
