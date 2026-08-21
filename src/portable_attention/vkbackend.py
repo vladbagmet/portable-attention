@@ -33,14 +33,14 @@ import contextlib
 import os
 import threading
 import warnings
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .dispatch import SdpaBackend, register_backend
 from .fused import scaled_dot_product_attention as _fused_sdpa
-from .tiling import DeviceLimits, TileSizingError, plan_tiles
+from .tiling import DeviceLimits, TileSizingError, plan_tiles, tile_plan_for
 from .vkattention import (
     BUFFER_COUNT,
     KERNEL_DTYPE_BYTES,
@@ -53,7 +53,7 @@ from .vkcompute import VulkanBuffer, VulkanContext, VulkanError, VulkanPipeline
 from .vulkan import VulkanCapability, detect_vulkan
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sized
 
 __all__ = [
     "DISABLE_ENV_VAR",
@@ -165,6 +165,7 @@ class VulkanAttention:
         self,
         *,
         limits: DeviceLimits | None = None,
+        tile_shape: tuple[int, int] | None = None,
         device_index: int | None = None,
         open_context: _OpenContext = VulkanContext.open,
         fallback: SdpaBackend | None = None,
@@ -176,13 +177,23 @@ class VulkanAttention:
                 the device reports. ``None`` (the default) asks the device
                 once it is open, and reports :data:`VULKAN_FLOOR_LIMITS` until
                 then.
+            tile_shape: ``(block_q, block_k)`` to compile every dispatch for,
+                bypassing the sizing policy's preference order. ``None`` (the
+                default) lets :func:`~portable_attention.plan_tiles` choose.
+                This is a tuning knob: a shape that does not fit the device,
+                or a call whose head dimension makes it not fit, takes the CPU
+                fallback rather than failing.
             device_index: Index into the loader's device enumeration, or
                 ``None`` for the first compute-capable device.
             open_context: How to open the device. Injectable for tests.
             fallback: Backend for calls the kernel does not cover. Defaults to
                 the ``fused`` CPU backend.
+
+        Raises:
+            ValueError: If ``tile_shape`` is not a pair of block sizes.
         """
         self._limits_override = limits
+        self._tile_shape = None if tile_shape is None else _as_tile_shape(tile_shape)
         self._limits = VULKAN_FLOOR_LIMITS if limits is None else limits
         self._device_index = device_index
         self._open_context = open_context
@@ -203,6 +214,11 @@ class VulkanAttention:
         win.
         """
         return self._limits
+
+    @property
+    def tile_shape(self) -> tuple[int, int] | None:
+        """The forced ``(block_q, block_k)``, or ``None`` when the policy picks."""
+        return self._tile_shape
 
     @property
     def device_calls(self) -> int:
@@ -344,13 +360,23 @@ class VulkanAttention:
         is_causal: bool,
     ) -> AttentionLaunch:
         """Size the tiles for this shape against the current device limits."""
-        plan = plan_tiles(
-            head_dim,
-            KERNEL_DTYPE_BYTES,
-            self._limits,
-            seq_len_q=seq_q,
-            seq_len_k=seq_k,
-        )
+        if self._tile_shape is None:
+            plan = plan_tiles(
+                head_dim,
+                KERNEL_DTYPE_BYTES,
+                self._limits,
+                seq_len_q=seq_q,
+                seq_len_k=seq_k,
+            )
+        else:
+            block_q, block_k = self._tile_shape
+            plan = tile_plan_for(
+                block_q,
+                block_k,
+                head_dim,
+                KERNEL_DTYPE_BYTES,
+                self._limits,
+            )
         return attention_launch(
             plan,
             stack=stack,
@@ -462,6 +488,40 @@ class VulkanAttention:
                 RuntimeWarning,
                 stacklevel=4,
             )
+
+
+def _as_tile_shape(tile_shape: object) -> tuple[int, int]:
+    """Validate a forced ``(block_q, block_k)`` pair at construction time.
+
+    Whether the shape fits the device cannot be known before one is open, but
+    whether it is a pair of block sizes at all can, and a typo in a tuning
+    sweep should not surface later as a silent CPU fallback. The argument is
+    typed ``object`` so the checks also cover untyped callers.
+    """
+    blocks = cast("tuple[object, ...]", tile_shape) if _is_pair(tile_shape) else None
+    if blocks is None:
+        raise ValueError(f"tile_shape must be (block_q, block_k), got {tile_shape!r}")
+    return _block_size("block_q", blocks[0]), _block_size("block_k", blocks[1])
+
+
+def _is_pair(value: object) -> bool:
+    """Is ``value`` a two-element tuple or list?"""
+    return isinstance(value, (tuple, list)) and len(cast("Sized", value)) == 2
+
+
+def _block_size(name: str, block: object) -> int:
+    """Return ``block`` as a positive block size, rejecting anything else.
+
+    Tile sizing only ever deals in powers of two, so a shape like ``(3, 16)``
+    is refused here rather than in :func:`~portable_attention.tile_plan_for`,
+    where it would read as "does not fit this device" and turn into a silent
+    CPU fallback on every call.
+    """
+    if isinstance(block, bool) or not isinstance(block, int) or block <= 0:
+        raise ValueError(f"tile_shape {name} must be a positive integer, got {block!r}")
+    if block & (block - 1):
+        raise ValueError(f"tile_shape {name} must be a power of two, got {block}")
+    return block
 
 
 def _as_stack(array: Array, stack: int) -> NDArray[np.float32]:

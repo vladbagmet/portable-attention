@@ -21,7 +21,13 @@ import pytest
 from portable_attention import assert_conforms, available_backends, get_backend
 from portable_attention.dispatch import _REGISTRY
 from portable_attention.fused import scaled_dot_product_attention as fused_sdpa
-from portable_attention.tiling import V3D_LIMITS, DeviceLimits, plan_tiles
+from portable_attention.tiling import (
+    V3D_LIMITS,
+    DeviceLimits,
+    TileSizingError,
+    plan_tiles,
+    tile_plan_for,
+)
 from portable_attention.vkattention import BUFFER_COUNT, PUSH_CONSTANT_BYTES
 from portable_attention.vkbackend import (
     DISABLE_ENV_VAR,
@@ -652,3 +658,107 @@ def test_device_backend_passes_the_conformance_kit() -> None:
         assert backend.device_calls > 0
     finally:
         backend.close()
+
+
+# --------------------------------------------------------------------------
+# forced tile shapes
+# --------------------------------------------------------------------------
+
+
+def test_a_forced_tile_shape_is_what_gets_compiled() -> None:
+    """The sweep knob: the named shape reaches the pipeline, not the policy's."""
+    ctx = _FakeContext()
+    backend = VulkanAttention(
+        tile_shape=(4, 16),
+        open_context=lambda *, device_index: ctx,  # type: ignore[arg-type]
+    )
+    q, k, v = _inputs(seq_q=64, seq_k=64, head_dim=64)
+
+    got = backend(q, k, v)
+
+    assert backend.tile_shape == (4, 16)
+    assert (ctx.pipelines[0].specialization[2], ctx.pipelines[0].specialization[3]) == (
+        4,
+        16,
+    )
+    policy = plan_tiles(64, 4, V3D_LIMITS, seq_len_q=64, seq_len_k=64)
+    assert (policy.block_q, policy.block_k) != (4, 16)
+    np.testing.assert_allclose(
+        got, get_backend("reference")(q, k, v), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_the_policy_is_what_runs_without_a_forced_shape() -> None:
+    backend, _ = _fake_backend()
+    assert backend.tile_shape is None
+
+
+def test_a_forced_shape_holds_across_head_dims() -> None:
+    """Unlike the policy, it does not shrink with the sequence or grow with room."""
+    ctx = _FakeContext()
+    backend = VulkanAttention(
+        tile_shape=(8, 8),
+        open_context=lambda *, device_index: ctx,  # type: ignore[arg-type]
+    )
+    backend(*_inputs(seq_q=4, seq_k=4, head_dim=16))
+    backend(*_inputs(seq_q=64, seq_k=64, head_dim=32))
+
+    assert backend.live_pipelines == 2  # head_dim is a specialization constant
+    assert all(
+        (pipeline.specialization[2], pipeline.specialization[3]) == (8, 8)
+        for pipeline in ctx.pipelines
+    )
+
+
+def test_a_forced_shape_that_does_not_fit_falls_back_to_the_cpu() -> None:
+    """A head dim that overflows shared memory at this shape is not an error."""
+    ctx = _FakeContext()
+    backend = VulkanAttention(
+        tile_shape=(32, 8),
+        open_context=lambda *, device_index: ctx,  # type: ignore[arg-type]
+    )
+    q, k, v = _inputs(seq_q=8, seq_k=8, head_dim=256)
+    with pytest.raises(TileSizingError):
+        tile_plan_for(32, 8, 256, 4, V3D_LIMITS)
+
+    got = backend(q, k, v)
+
+    np.testing.assert_allclose(got, fused_sdpa(q, k, v), rtol=1e-5, atol=1e-5)
+    assert backend.device_calls == 0 and ctx.pipelines == []
+
+
+@pytest.mark.parametrize(
+    "tile_shape",
+    [(16,), (4, 8, 16), (0, 16), (4, -8), (4.0, 16), (True, 16), (3, 16), (8, 12)],
+)
+def test_a_malformed_tile_shape_is_rejected_at_construction(tile_shape: Any) -> None:
+    """A shape the policy could never produce fails loudly, not by falling back."""
+    with pytest.raises(ValueError, match="tile_shape"):
+        VulkanAttention(tile_shape=tile_shape)
+
+
+@pytest.mark.skipif(not vulkan_available(), reason="no Vulkan compute device")
+@pytest.mark.parametrize("tile_shape", [(1, 16), (4, 16), (8, 8), (16, 4), (32, 8)])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_forced_shapes_agree_with_the_oracle_on_the_device(
+    tile_shape: tuple[int, int], is_causal: bool
+) -> None:
+    """Every shape a sweep may pick computes the same attention, not just the
+    one the policy prefers.
+
+    All five fit the smallest device this project targets at ``head_dim=64``,
+    so ``device_calls`` catches a shape that quietly took the CPU path.
+    """
+    backend = VulkanAttention(tile_shape=tile_shape)
+    q, k, v = _inputs(stack=(2,), seq_q=40, seq_k=40, head_dim=64)
+    try:
+        got = backend(q, k, v, is_causal=is_causal)
+        assert backend.device_calls == 1
+    finally:
+        backend.close()
+    np.testing.assert_allclose(
+        got,
+        get_backend("reference")(q, k, v, is_causal=is_causal),
+        rtol=1e-4,
+        atol=1e-4,
+    )

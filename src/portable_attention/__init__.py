@@ -55,8 +55,10 @@ from .tiling import (
     DeviceLimits,
     TilePlan,
     TileSizingError,
+    candidate_plans,
     plan_tiles,
     shared_memory_bytes_for,
+    tile_plan_for,
 )
 from .vkbackend import VulkanAttention, register_vulkan_backend
 from .vkcompute import VulkanBuffer, VulkanContext, VulkanError, VulkanPipeline
@@ -80,6 +82,7 @@ __all__ = [
     "assert_conforms",
     "available_backends",
     "blocked_attention",
+    "candidate_plans",
     "check_backend",
     "conformance_cases",
     "detect_vulkan",
@@ -89,6 +92,7 @@ __all__ = [
     "register_vulkan_backend",
     "scaled_dot_product_attention",
     "shared_memory_bytes_for",
+    "tile_plan_for",
     "vulkan_available",
 ]
 

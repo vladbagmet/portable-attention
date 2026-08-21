@@ -38,6 +38,10 @@ below keeps small by favouring wide key tiles.
 
 Among the tiles that fit, the policy prefers the largest workgroup (occupancy),
 then the widest key tile (fewer passes over K/V), then the widest query tile.
+That order is a hypothesis about hardware, not a proof, so the whole feasible
+set is available through :func:`candidate_plans` and a single shape can be
+requested through :func:`tile_plan_for` — which is how a backend gets swept
+across tile shapes without the policy being edited to run the experiment.
 Sequence lengths, when known, cap the blocks: each cap is the next power of two
 at or above the length, so one tile can still cover the whole sequence
 (``seq_len_q=3`` permits ``block_q=4``) while a 24-row key sequence never draws
@@ -54,8 +58,10 @@ __all__ = [
     "DeviceLimits",
     "TilePlan",
     "TileSizingError",
+    "candidate_plans",
     "plan_tiles",
     "shared_memory_bytes_for",
+    "tile_plan_for",
 ]
 
 
@@ -251,6 +257,137 @@ def _next_power_of_two(value: int) -> int:
     return power
 
 
+def tile_plan_for(
+    block_q: int,
+    block_k: int,
+    head_dim: int,
+    dtype_bytes: int,
+    limits: DeviceLimits,
+) -> TilePlan:
+    """Build the plan for one explicitly chosen tile shape.
+
+    This is the escape hatch from the preference order: a caller that wants to
+    measure ``4 x 64`` against ``8 x 32`` names the shape and gets a plan that
+    has been checked against the device, or an error saying which limit it
+    misses. Legality is still the policy's to decide, so a shape that does not
+    fit never reaches a kernel.
+
+    Args:
+        block_q: Query rows per workgroup. A power of two.
+        block_k: Key/value rows per streaming step. A power of two.
+        head_dim: Head dimension (``E``) the kernel will run.
+        dtype_bytes: Size of one element of the kernel's compute dtype.
+        limits: The target device's limits.
+
+    Returns:
+        The plan for exactly this shape.
+
+    Raises:
+        ValueError: If any argument is not a positive integer, or a block size
+            is not a power of two.
+        TileSizingError: If the shape exceeds the device's workgroup size or
+            shared memory.
+    """
+    for field, value in (("block_q", block_q), ("block_k", block_k)):
+        _require_positive_int(field, value)
+        if value & (value - 1):
+            raise ValueError(f"{field} must be a power of two, got {value}")
+    threads = block_q * block_k
+    if threads > limits.max_threads_per_group:
+        raise TileSizingError(
+            f"tile {block_q}x{block_k} needs {threads} invocations per "
+            f"workgroup but {limits.name or 'the device'} allows "
+            f"{limits.max_threads_per_group}"
+        )
+    used = shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes)
+    if used > limits.shared_memory_bytes:
+        raise TileSizingError(
+            f"tile {block_q}x{block_k} at head_dim={head_dim} and dtype_bytes="
+            f"{dtype_bytes} needs {used} bytes of shared memory but "
+            f"{limits.name or 'the device'} has {limits.shared_memory_bytes}"
+        )
+    return TilePlan(
+        block_q=block_q,
+        block_k=block_k,
+        threads_per_group=threads,
+        shared_memory_bytes=used,
+        head_dim=head_dim,
+        dtype_bytes=dtype_bytes,
+        limits=limits,
+    )
+
+
+def candidate_plans(
+    head_dim: int,
+    dtype_bytes: int,
+    limits: DeviceLimits,
+    *,
+    seq_len_q: int | None = None,
+    seq_len_k: int | None = None,
+) -> list[TilePlan]:
+    """Every tile shape that fits this device, most preferred first.
+
+    :func:`plan_tiles` returns the head of this list. The tail is what a tuning
+    sweep measures: same legality rules, no claim about which shape is fastest.
+
+    Args:
+        head_dim: Head dimension (``E``) the kernel will run.
+        dtype_bytes: Size of one element of the kernel's compute dtype.
+        limits: The target device's limits.
+        seq_len_q: Query sequence length, when known. Caps ``block_q`` at the
+            next power of two at or above it.
+        seq_len_k: Key/value sequence length, when known. Caps ``block_k`` the
+            same way.
+
+    Returns:
+        The feasible plans, sorted by the preference order documented in the
+        module docstring. Empty when nothing fits.
+
+    Raises:
+        ValueError: If any argument is not a positive integer.
+    """
+    for field, value in (("head_dim", head_dim), ("dtype_bytes", dtype_bytes)):
+        _require_positive_int(field, value)
+    for field, optional in (("seq_len_q", seq_len_q), ("seq_len_k", seq_len_k)):
+        if optional is not None:
+            _require_positive_int(field, optional)
+
+    max_threads = limits.max_threads_per_group
+    q_cap = (
+        max_threads
+        if seq_len_q is None
+        else min(max_threads, _next_power_of_two(seq_len_q))
+    )
+    k_cap = (
+        max_threads
+        if seq_len_k is None
+        else min(max_threads, _next_power_of_two(seq_len_k))
+    )
+
+    plans: list[TilePlan] = []
+    for block_q in _powers_of_two_upto(q_cap):
+        for block_k in _powers_of_two_upto(k_cap):
+            threads = block_q * block_k
+            if threads > max_threads:
+                break  # block_k only grows from here
+            used = shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes)
+            if used > limits.shared_memory_bytes:
+                break  # so does the shared-memory footprint
+            plans.append(
+                TilePlan(
+                    block_q=block_q,
+                    block_k=block_k,
+                    threads_per_group=threads,
+                    shared_memory_bytes=used,
+                    head_dim=head_dim,
+                    dtype_bytes=dtype_bytes,
+                    limits=limits,
+                )
+            )
+    plans.sort(key=_rank, reverse=True)
+    return plans
+
+
 def plan_tiles(
     head_dim: int,
     dtype_bytes: int,
@@ -281,53 +418,21 @@ def plan_tiles(
         TileSizingError: If not even a single query row against a single key
             row fits in the device's shared memory.
     """
-    for field, value in (("head_dim", head_dim), ("dtype_bytes", dtype_bytes)):
-        _require_positive_int(field, value)
-    for field, optional in (("seq_len_q", seq_len_q), ("seq_len_k", seq_len_k)):
-        if optional is not None:
-            _require_positive_int(field, optional)
-
-    max_threads = limits.max_threads_per_group
-    q_cap = (
-        max_threads
-        if seq_len_q is None
-        else min(max_threads, _next_power_of_two(seq_len_q))
+    plans = candidate_plans(
+        head_dim,
+        dtype_bytes,
+        limits,
+        seq_len_q=seq_len_q,
+        seq_len_k=seq_len_k,
     )
-    k_cap = (
-        max_threads
-        if seq_len_k is None
-        else min(max_threads, _next_power_of_two(seq_len_k))
-    )
-
-    best: TilePlan | None = None
-    for block_q in _powers_of_two_upto(q_cap):
-        for block_k in _powers_of_two_upto(k_cap):
-            threads = block_q * block_k
-            if threads > max_threads:
-                break  # block_k only grows from here
-            used = shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes)
-            if used > limits.shared_memory_bytes:
-                break  # so does the shared-memory footprint
-            candidate = TilePlan(
-                block_q=block_q,
-                block_k=block_k,
-                threads_per_group=threads,
-                shared_memory_bytes=used,
-                head_dim=head_dim,
-                dtype_bytes=dtype_bytes,
-                limits=limits,
-            )
-            if best is None or _rank(candidate) > _rank(best):
-                best = candidate
-
-    if best is None:
+    if not plans:
         needed = shared_memory_bytes_for(1, 1, head_dim, dtype_bytes)
         raise TileSizingError(
             f"no tile fits {limits.name or 'device'}: a 1x1 tile at head_dim="
             f"{head_dim} and dtype_bytes={dtype_bytes} needs {needed} bytes of "
             f"shared memory but only {limits.shared_memory_bytes} are available"
         )
-    return best
+    return plans[0]
 
 
 def _rank(plan: TilePlan) -> tuple[int, int, int]:

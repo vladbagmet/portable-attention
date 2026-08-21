@@ -18,8 +18,10 @@ from portable_attention.tiling import (
     DeviceLimits,
     TilePlan,
     TileSizingError,
+    candidate_plans,
     plan_tiles,
     shared_memory_bytes_for,
+    tile_plan_for,
 )
 
 # Head dimensions in common use (GPT-2 through Llama-class models) crossed with
@@ -293,3 +295,133 @@ def test_plans_are_immutable_and_comparable():
     with pytest.raises(AttributeError):
         plan.block_q = 1  # type: ignore[misc]
     assert isinstance(plan, TilePlan)
+
+
+# --------------------------------------------------------------------------
+# the feasible set and explicitly chosen shapes
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("limits", "head_dim", "dtype_bytes"),
+    list(itertools.product(DEVICES, HEAD_DIMS, DTYPE_BYTES)),
+)
+def test_every_candidate_is_legal_on_the_device(limits, head_dim, dtype_bytes):
+    # A sweep runs whatever this returns, so "fits" has to hold for the tail
+    # of the list exactly as it does for the head.
+    for plan in candidate_plans(head_dim, dtype_bytes, limits):
+        assert plan.threads_per_group == plan.block_q * plan.block_k
+        assert plan.threads_per_group <= limits.max_threads_per_group
+        assert plan.shared_memory_bytes <= limits.shared_memory_bytes
+        assert plan.shared_memory_bytes == shared_memory_bytes_for(
+            plan.block_q, plan.block_k, head_dim, dtype_bytes
+        )
+
+
+def test_the_policy_picks_the_head_of_the_candidate_list():
+    for limits, head_dim in itertools.product(DEVICES, HEAD_DIMS):
+        plans = candidate_plans(head_dim, 4, limits)
+        assert plans[0] == plan_tiles(head_dim, 4, limits)
+
+
+def test_candidates_are_distinct_and_ordered_by_preference():
+    plans = candidate_plans(64, 4, V3D_LIMITS)
+    shapes = [(plan.block_q, plan.block_k) for plan in plans]
+    assert len(set(shapes)) == len(shapes)
+    keys = [(plan.threads_per_group, plan.block_k, plan.block_q) for plan in plans]
+    assert keys == sorted(keys, reverse=True)
+
+
+def test_sequence_lengths_only_remove_candidates():
+    unbounded = set(candidate_plans(64, 4, V3D_LIMITS))
+    capped = set(candidate_plans(64, 4, V3D_LIMITS, seq_len_q=4, seq_len_k=32))
+    assert capped < unbounded
+    assert all(plan.block_q <= 4 and plan.block_k <= 32 for plan in capped)
+
+
+def test_no_candidates_is_the_same_condition_that_raises():
+    assert candidate_plans(4096, 8, V3D_LIMITS) == []
+    with pytest.raises(TileSizingError):
+        plan_tiles(4096, 8, V3D_LIMITS)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"head_dim": 0}, "head_dim must be a positive integer"),
+        ({"dtype_bytes": 4.5}, "dtype_bytes must be a positive integer"),
+        ({"seq_len_q": -1}, "seq_len_q must be a positive integer"),
+        ({"seq_len_k": True}, "seq_len_k must be a positive integer"),
+    ],
+)
+def test_candidate_plans_validation(kwargs, message):
+    base = {"head_dim": 64, "dtype_bytes": 4, "limits": V3D_LIMITS}
+    with pytest.raises(ValueError, match=message):
+        candidate_plans(**{**base, **kwargs})
+
+
+def test_an_explicit_shape_is_the_shape_returned():
+    plan = tile_plan_for(4, 16, 64, 4, V3D_LIMITS)
+    assert (plan.block_q, plan.block_k) == (4, 16)
+    assert plan.threads_per_group == 64
+    assert plan.shared_memory_bytes == shared_memory_bytes_for(4, 16, 64, 4)
+    assert plan.limits is V3D_LIMITS
+
+
+def test_an_explicit_shape_can_lose_to_the_policy():
+    # The point of the escape hatch: a legal but non-preferred shape, which is
+    # what a tuning sweep is made of.
+    chosen = tile_plan_for(16, 4, 64, 4, V3D_LIMITS)
+    assert chosen != plan_tiles(64, 4, V3D_LIMITS)
+    assert chosen.shared_memory_bytes <= V3D_LIMITS.shared_memory_bytes
+
+
+def test_every_candidate_round_trips_through_the_explicit_builder():
+    for plan in candidate_plans(32, 4, V3D_LIMITS):
+        assert tile_plan_for(plan.block_q, plan.block_k, 32, 4, V3D_LIMITS) == plan
+
+
+@pytest.mark.parametrize(("block_q", "block_k"), [(3, 16), (8, 12), (1, 5)])
+def test_explicit_shapes_must_be_powers_of_two(block_q, block_k):
+    with pytest.raises(ValueError, match="must be a power of two"):
+        tile_plan_for(block_q, block_k, 64, 4, V3D_LIMITS)
+
+
+def test_an_oversized_workgroup_names_the_invocation_limit():
+    with pytest.raises(TileSizingError, match="invocations per workgroup"):
+        tile_plan_for(64, 16, 8, 4, V3D_LIMITS)
+
+
+def test_an_oversized_layout_names_the_shared_memory_limit():
+    with pytest.raises(TileSizingError, match="bytes of shared memory"):
+        tile_plan_for(8, 32, 256, 4, V3D_LIMITS)
+
+
+def test_an_unnamed_device_still_explains_a_rejected_shape():
+    nameless = DeviceLimits(
+        shared_memory_bytes=16384, max_threads_per_group=64, simd_width=16
+    )
+    with pytest.raises(TileSizingError, match="the device"):
+        tile_plan_for(16, 16, 32, 4, nameless)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"block_q": 0}, "block_q must be a positive integer"),
+        ({"block_k": -4}, "block_k must be a positive integer"),
+        ({"block_k": True}, "block_k must be a positive integer"),
+        ({"head_dim": 0}, "head_dim must be a positive integer"),
+        ({"dtype_bytes": 4.5}, "dtype_bytes must be a positive integer"),
+    ],
+)
+def test_tile_plan_for_validation(kwargs, message):
+    base = {
+        "block_q": 4,
+        "block_k": 16,
+        "head_dim": 64,
+        "dtype_bytes": 4,
+        "limits": V3D_LIMITS,
+    }
+    with pytest.raises(ValueError, match=message):
+        tile_plan_for(**{**base, **kwargs})

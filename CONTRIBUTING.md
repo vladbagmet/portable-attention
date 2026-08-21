@@ -70,6 +70,19 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   ./scripts/vulkan-conformance.sh
 ```
 
+## Sweeping tile shapes
+
+When a kernel or the sizing policy changes, `scripts/tile-sweep.py` times the
+device at several `block_q x block_k` shapes and prints a Markdown table:
+
+```sh
+python scripts/tile-sweep.py --tiles 16x16,32x8,8x16 --repeats 8
+```
+
+It registers one backend per tile shape and counts device calls per benchmark
+shape, so a tile that fell back to the CPU on one row shows up as a non-zero
+exit naming that row instead of a suspiciously good latency.
+
 ## Verifying the Metal backend
 
 No CI runner the project controls has an Apple GPU, so Metal changes cannot be
