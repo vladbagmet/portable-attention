@@ -55,7 +55,7 @@ Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 and 256 invocations per workgroup. Tile plan 16×16 (the policy's choice) in both
 columns; all 44 calls per column ran on the device.
 
-Both columns were measured back to back in the same session on the branch for
+Both columns were measured back-to-back in the same session on the branch for
 this change, the only difference being which `attention.spv` the package shipped: the previous kernel read the Q
 and K tiles one float at a time, the new one reads them as `vec4` whenever the
 head dimension is a multiple of four.
