@@ -43,6 +43,72 @@ Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 
 ---
 
+## 2026-08-22 — commit 38fa537 — full-suite run from a clean checkout
+
+**Environment:** aarch64, 4 CPUs, 8 GB RAM, Linux 6.12.96. Python 3.12.13,
+NumPy 2.5.2 (scipy-openblas 0.3.34, pthreads). portable-attention 0.0.1.
+`threadpoolctl` 3.6.0. Fresh `git clone` + `uv sync --extra dev`.
+
+**BLAS threads (process default, via threadpoolctl):** openblas=4.
+
+**Vulkan devices enumerated:** `V3D 7.1.7.0` (Vulkan 1.2.289, 16 KiB shared /
+256 invocations / SIMD 16) and `llvmpipe (LLVM 15.0.6, 128 bits)` (Vulkan
+1.3.289, 32 KiB / 1024 / SIMD 16).
+
+Full gate from the fresh clone (`scripts/check.sh`): **891 passed**, **100%**
+coverage over 1692 statements, ruff/format/pyright-strict/bandit/pip-audit all
+clean, 22 s wall clock. `scripts/vulkan-conformance.sh` on the integrated GPU:
+**301 passed**; the same script pinned to lavapipe: **283 passed** (the device
+suite parametrizes over enumerated compute devices, hence the count difference).
+Install smoke: `uv build` → wheel installed into a throwaway venv → default and
+`is_causal=True` calls OK; `available_backends()` → `['fused', 'reference',
+'vulkan']`, so the shader ships inside the wheel; `get_backend("reference")`,
+`get_backend("fused")` and `get_backend("auto")` each return correct-shape
+output.
+
+### Latency by shape and backend (pinned to 1 BLAS thread, median over 8 repeats)
+
+| shape (B,H,S,D)  | reference |     fused |     vulkan | fused vs ref | vulkan vs ref |
+|------------------|----------:|----------:|-----------:|-------------:|--------------:|
+| (1, 1, 64, 32)   |  0.171 ms |  0.116 ms |   0.735 ms |        1.47× |         0.23× |
+| (1, 8, 128, 64)  |  5.936 ms |  3.081 ms |   9.601 ms |        1.93× |         0.62× |
+| (2, 8, 256, 64)  | 48.298 ms | 23.835 ms |  72.487 ms |        2.03× |         0.67× |
+| (1, 12, 512, 64) | 134.81 ms | 65.546 ms | 218.269 ms |        2.06× |         0.62× |
+
+### Same shapes with no thread pin applied (median over 8 repeats)
+
+The harness leaves the process default in place here (openblas=4). That is the
+effective policy for `reference`; `fused` still applies its own one-thread cap
+internally on batched inputs, and `vulkan` does the work on the GPU.
+
+| shape (B,H,S,D)  | reference |     fused |     vulkan | fused vs ref | vulkan vs ref |
+|------------------|----------:|----------:|-----------:|-------------:|--------------:|
+| (1, 1, 64, 32)   |  0.175 ms |  0.120 ms |   0.744 ms |        1.45× |         0.24× |
+| (1, 8, 128, 64)  |  7.957 ms |  3.708 ms |   9.554 ms |        2.15× |         0.83× |
+| (2, 8, 256, 64)  | 37.361 ms | 24.907 ms |  72.299 ms |        1.50× |         0.52× |
+| (1, 12, 512, 64) | 114.52 ms | 71.731 ms | 218.853 ms |        1.60× |         0.52× |
+
+`fused` is the fastest backend on every shape under both thread policies, and
+the `vulkan` numbers reproduce the 2026-08-22 kernel block to within 0.3%
+(218.3 ms vs 218.4 ms on `(1, 12, 512, 64)`), which is the useful check here:
+that block was measured on a branch, this one on a clean clone of `main`.
+
+`reference` at 1 thread came in 5–7% above the 2026-08-01 clean-checkout run
+(48.3 vs 45.3 ms and 134.8 vs 125.9 ms). Three consecutive runs here landed
+within 1% of each other (47.7–48.3 ms and 134.8–138.5 ms), so the difference is
+persistent across this session rather than a single unlucky sample — but the
+baseline was a 20-repeat median against 8 here, no dispersion was recorded on
+either side, and pinned `reference` medians have moved by more than this between
+blocks that shared an OpenBLAS version. One untested hypothesis for it is the
+OpenBLAS bump that came with NumPy 2.5.2 (0.3.33 → 0.3.34); nothing else in the
+environment was held fixed, so that is a guess, not a measurement. `fused` and
+`vulkan` are unchanged. Not filed as a regression — a few percent on the
+slow-path oracle, not on a shipped fast path.
+
+No regressions found; no issues filed.
+
+---
+
 ## 2026-08-22 — commit 1502c5d — vec4 dot product in the Vulkan kernel
 
 **Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention
