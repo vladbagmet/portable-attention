@@ -20,6 +20,12 @@ kernel's compute dtype::
     S tile      block_q * block_k     (scores for the current KV tile)
     stats       2 * block_q           (running max and running sum per row)
 
+The three data tiles are rounded up to a whole number of
+:data:`VECTOR_LANES`-element vectors. GPUs load shared memory fastest in short
+vectors, so a kernel is free to declare those tiles as ``vec4`` arrays, and the
+budget prices the padding that rounding can add (at most three elements per
+tile, and none at all when ``head_dim`` is a multiple of four).
+
 The thread mapping is one invocation per score element, so a workgroup holds
 ``block_q * block_k`` invocations: each computes one ``q.k`` dot product, then
 the group reduces along the key axis for the softmax. Both block sizes are
@@ -54,6 +60,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "M1_PRO_LIMITS",
+    "VECTOR_LANES",
     "V3D_LIMITS",
     "DeviceLimits",
     "TilePlan",
@@ -63,6 +70,12 @@ __all__ = [
     "shared_memory_bytes_for",
     "tile_plan_for",
 ]
+
+
+#: Elements per shared-memory vector. The Q/K/V tiles are allocated in whole
+#: vectors of this many elements so a kernel can load them four-wide; see the
+#: module docstring.
+VECTOR_LANES = 4
 
 
 class TileSizingError(ValueError):
@@ -233,12 +246,17 @@ def shared_memory_bytes_for(
     ):
         _require_positive_int(field, value)
     elements = (
-        block_q * head_dim  # Q tile
-        + 2 * block_k * head_dim  # K and V tiles
+        _whole_vectors(block_q * head_dim)  # Q tile
+        + 2 * _whole_vectors(block_k * head_dim)  # K and V tiles
         + block_q * block_k  # scores for the current KV tile
         + 2 * block_q  # running max and running sum per query row
     )
     return elements * dtype_bytes
+
+
+def _whole_vectors(elements: int) -> int:
+    """Round an element count up to a whole number of :data:`VECTOR_LANES`."""
+    return -(-elements // VECTOR_LANES) * VECTOR_LANES
 
 
 def _powers_of_two_upto(cap: int) -> list[int]:
