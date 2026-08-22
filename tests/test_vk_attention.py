@@ -211,7 +211,9 @@ def _compute_device_indices() -> list[int]:
 # (stack, seq_q, seq_k, head_dim). Between them these cover a single-element
 # problem, partial query and key tiles, unequal sequence lengths, a head dim
 # that needs several accumulators per invocation, and a plan whose workgroup
-# is smaller than the device maximum.
+# is smaller than the device maximum. head_dim 6 and 13 are not multiples of
+# four, which is what selects the shader's scalar dot product over its
+# vectorized one.
 _SHAPES = [
     (1, 1, 1, 8),
     (2, 6, 10, 8),
@@ -219,6 +221,8 @@ _SHAPES = [
     (2, 17, 5, 32),
     (1, 33, 33, 64),
     (1, 12, 12, 128),
+    (2, 9, 6, 6),
+    (1, 5, 20, 13),
 ]
 
 

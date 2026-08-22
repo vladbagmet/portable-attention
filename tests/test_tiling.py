@@ -15,6 +15,7 @@ import pytest
 from portable_attention.tiling import (
     M1_PRO_LIMITS,
     V3D_LIMITS,
+    VECTOR_LANES,
     DeviceLimits,
     TilePlan,
     TileSizingError,
@@ -287,6 +288,40 @@ def test_shared_memory_layout_is_the_documented_sum():
         block_q * head_dim + 2 * block_k * head_dim + block_q * block_k + 2 * block_q
     ) * dtype_bytes
     assert shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes) == expected
+
+
+@pytest.mark.parametrize("head_dim", [4, 8, 64, 128])
+def test_aligned_head_dim_pays_no_vector_padding(head_dim):
+    # head_dim % VECTOR_LANES == 0 makes every tile row a whole number of
+    # vectors, so the budget is the plain sum with nothing rounded up.
+    block_q, block_k, dtype_bytes = 8, 16, 4
+    unpadded = (
+        block_q * head_dim + 2 * block_k * head_dim + block_q * block_k + 2 * block_q
+    ) * dtype_bytes
+    assert shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes) == unpadded
+
+
+@pytest.mark.parametrize(("block_q", "block_k", "head_dim"), [(2, 2, 3), (1, 3, 5)])
+def test_unaligned_tiles_are_priced_as_whole_vectors(block_q, block_k, head_dim):
+    # The kernel allocates Q/K/V as vector arrays, so a tile that does not fill
+    # its last vector still costs the whole thing. Missing this would let a plan
+    # claim to fit in shared memory the kernel cannot allocate.
+    dtype_bytes = 4
+
+    def whole_vectors(elements):
+        return -(-elements // VECTOR_LANES) * VECTOR_LANES
+
+    expected = (
+        whole_vectors(block_q * head_dim)
+        + 2 * whole_vectors(block_k * head_dim)
+        + block_q * block_k
+        + 2 * block_q
+    ) * dtype_bytes
+    plain = (
+        block_q * head_dim + 2 * block_k * head_dim + block_q * block_k + 2 * block_q
+    ) * dtype_bytes
+    assert shared_memory_bytes_for(block_q, block_k, head_dim, dtype_bytes) == expected
+    assert expected > plain
 
 
 def test_plans_are_immutable_and_comparable():

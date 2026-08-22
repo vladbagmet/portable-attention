@@ -43,6 +43,51 @@ Hardware floor for this project: a low-power ARM board (aarch64, 4× Cortex-A76,
 
 ---
 
+## 2026-08-22 — commit 1502c5d — vec4 dot product in the Vulkan kernel
+
+**Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention
+0.0.1. `threadpoolctl` 3.6.0.
+
+**BLAS threads (process default, threadpoolctl):** openblas=4 — no pinning, so
+`fused` is the pinned-internally backend described above.
+
+**Device:** `V3D 7.1.7.0` (Vulkan 1.2.289), integrated GPU, 16 KiB shared memory
+and 256 invocations per workgroup. Tile plan 16×16 (the policy's choice) in both
+columns; all 44 calls per column ran on the device.
+
+Both columns were measured back to back in the same session on the branch for
+this change, the only difference being which `attention.spv` the package shipped: the previous kernel read the Q
+and K tiles one float at a time, the new one reads them as `vec4` whenever the
+head dimension is a multiple of four.
+
+Generated with:
+
+```sh
+python scripts/tile-sweep.py --tiles 16x16 --repeats 8
+```
+
+### Latency, scalar vs vectorized q·k (median over 8 repeats)
+
+| shape (B,H,S,D) | fused | vulkan, scalar | vulkan, vec4 | speedup | vec4 vs fused |
+|------------------|---------:|---------------:|-------------:|--------:|--------------:|
+| (1, 1, 64, 32)   | 0.145 ms |       0.558 ms |     0.410 ms |   1.36× |         0.30× |
+| (1, 8, 128, 64)  | 3.769 ms |      17.333 ms |     9.699 ms |   1.79× |         0.36× |
+| (2, 8, 256, 64)  | 26.783 ms |    134.211 ms |    72.474 ms |   1.85× |         0.34× |
+| (1, 12, 512, 64) | 77.734 ms |    403.542 ms |   218.378 ms |   1.85× |         0.33× |
+
+The 2026-08-21 sweep pointed at what an invocation *does* rather than at the tile
+shape, and this is the cheapest version of that: four elements per shared-memory
+access instead of one in the score phase. It buys 1.85× on the three head_dim=64
+shapes and 1.36× on the head_dim=32 one, where each row is only eight vectors
+long and the loop overhead is a larger share of the work.
+
+The gap against `fused` narrows from ~5.2× to ~3.1× and stops widening with
+sequence length. The P·V phase is still scalar — its V-tile reads run down a
+column, so vectorizing it needs a transposed tile, not just a different load —
+and that is the next thing worth measuring on this part.
+
+---
+
 ## 2026-08-21 — commit ec40b37 — Vulkan tile-shape sweep
 
 **Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention

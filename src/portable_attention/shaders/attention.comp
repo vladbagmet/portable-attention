@@ -13,6 +13,11 @@
 // row i; those accumulators live in registers, which is why the shared-memory
 // budget in tiling.py has no output tile.
 //
+// The Q/K/V tiles are declared as vec4 arrays: a head dimension that is a
+// multiple of four keeps each row vector-aligned, so the q.k dot product reads
+// four elements per shared-memory access instead of one. Other head dimensions
+// take the scalar loop over the same storage; both index it through TILE_AT.
+//
 // Every tile shape is a specialization constant, so the plan chosen by
 // plan_tiles() for a device is baked in when the pipeline is built. Compiled
 // to attention.spv, committed next to this file:
@@ -48,10 +53,15 @@ layout(push_constant) uniform Params {
     uint causal;
 } params;
 
-shared float qTile[Q_TILE_LEN];
-shared float kTile[KV_TILE_LEN];
-shared float vTile[KV_TILE_LEN];
+// Tiles are allocated in whole vec4s, which is what shared_memory_bytes_for()
+// prices them at. TILE_AT addresses one element of such an array by its
+// row-major float index.
+shared vec4 qTile[(Q_TILE_LEN + 3) / 4];
+shared vec4 kTile[(KV_TILE_LEN + 3) / 4];
+shared vec4 vTile[(KV_TILE_LEN + 3) / 4];
 shared float sTile[S_TILE_LEN];
+
+#define TILE_AT(tile, index) tile[(index) / 4u][(index) % 4u]
 shared float rowMaxState[BLOCK_Q];
 shared float rowSumState[BLOCK_Q];
 
@@ -76,7 +86,8 @@ void main() {
         uint r = idx / uint(HEAD_DIM);
         uint c = idx % uint(HEAD_DIM);
         uint g = qStart + r;
-        qTile[idx] = g < params.seq_q ? qBuf.value[qBase + g * uint(HEAD_DIM) + c] : 0.0;
+        TILE_AT(qTile, idx) =
+            g < params.seq_q ? qBuf.value[qBase + g * uint(HEAD_DIM) + c] : 0.0;
     }
     if (lane == 0u) {
         rowMaxState[row] = NEG_INF;
@@ -101,8 +112,8 @@ void main() {
             uint g = kStart + r;
             bool live = g < params.seq_k;
             uint at = kvBase + g * uint(HEAD_DIM) + c;
-            kTile[idx] = live ? kBuf.value[at] : 0.0;
-            vTile[idx] = live ? vBuf.value[at] : 0.0;
+            TILE_AT(kTile, idx) = live ? kBuf.value[at] : 0.0;
+            TILE_AT(vTile, idx) = live ? vBuf.value[at] : 0.0;
         }
         barrier();
 
@@ -112,12 +123,21 @@ void main() {
             && (params.causal == 0u || keyIndex <= queryIndex);
         float score = NEG_INF;
         if (allowed) {
-            float dot = 0.0;
-            for (int d = 0; d < HEAD_DIM; ++d) {
-                dot += qTile[row * uint(HEAD_DIM) + uint(d)]
-                    * kTile[lane * uint(HEAD_DIM) + uint(d)];
+            float total = 0.0;
+            if (HEAD_DIM % 4 == 0) {
+                // Both indices are compile-time constants here, so the driver
+                // sees a vec4 stride and the scalar loop below is dead code.
+                const uint vecs = uint(HEAD_DIM) / 4u;
+                for (uint d = 0u; d < vecs; ++d) {
+                    total += dot(qTile[row * vecs + d], kTile[lane * vecs + d]);
+                }
+            } else {
+                for (uint d = 0u; d < uint(HEAD_DIM); ++d) {
+                    total += TILE_AT(qTile, row * uint(HEAD_DIM) + d)
+                        * TILE_AT(kTile, lane * uint(HEAD_DIM) + d);
+                }
             }
-            score = dot * params.scale;
+            score = total * params.scale;
         }
         sTile[row * uint(BLOCK_K) + lane] = score;
         barrier();
@@ -146,7 +166,7 @@ void main() {
                 float sum = 0.0;
                 for (int j = 0; j < BLOCK_K; ++j) {
                     sum += sTile[row * uint(BLOCK_K) + uint(j)]
-                        * vTile[uint(j) * uint(HEAD_DIM) + col];
+                        * TILE_AT(vTile, uint(j) * uint(HEAD_DIM) + col);
                 }
                 acc[c] = acc[c] * rescale + sum;
             }
