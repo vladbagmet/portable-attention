@@ -62,8 +62,9 @@ clean, 22 s wall clock. `scripts/vulkan-conformance.sh` on the integrated GPU:
 suite parametrizes over enumerated compute devices, hence the count difference).
 Install smoke: `uv build` → wheel installed into a throwaway venv → default and
 `is_causal=True` calls OK; `available_backends()` → `['fused', 'reference',
-'vulkan']`, so the shader ships inside the wheel; `get_backend('reference' |
-'fused' | 'auto')` all return correct-shape output.
+'vulkan']`, so the shader ships inside the wheel; `get_backend("reference")`,
+`get_backend("fused")` and `get_backend("auto")` each return correct-shape
+output.
 
 ### Latency by shape and backend (pinned to 1 BLAS thread, median over 8 repeats)
 
@@ -74,7 +75,11 @@ Install smoke: `uv build` → wheel installed into a throwaway venv → default 
 | (2, 8, 256, 64)  | 48.298 ms | 23.835 ms |  72.487 ms |        2.03× |         0.67× |
 | (1, 12, 512, 64) | 134.81 ms | 65.546 ms | 218.269 ms |        2.06× |         0.62× |
 
-### Same shapes at default OpenBLAS threads (median over 8 repeats)
+### Same shapes with no thread pin applied (median over 8 repeats)
+
+The harness leaves the process default in place here (openblas=4). That is the
+effective policy for `reference`; `fused` still applies its own one-thread cap
+internally on batched inputs, and `vulkan` does the work on the GPU.
 
 | shape (B,H,S,D)  | reference |     fused |     vulkan | fused vs ref | vulkan vs ref |
 |------------------|----------:|----------:|-----------:|-------------:|--------------:|
@@ -89,12 +94,16 @@ the `vulkan` numbers reproduce the 2026-08-22 kernel block to within 0.3%
 that block was measured on a branch, this one on a clean clone of `main`.
 
 `reference` at 1 thread came in 5–7% above the 2026-08-01 clean-checkout run
-(48.3 vs 45.3 ms and 134.8 vs 125.9 ms), and the gap repeated across three
-consecutive runs rather than drifting, so it is not sampling noise. The likely
-cause is the OpenBLAS bump that arrived with NumPy 2.5.2 (0.3.33 → 0.3.34);
-`fused` and `vulkan` are unaffected because neither leans on batched small
-GEMMs. Not filed as a regression — it is a few percent on the slow-path oracle,
-not on a shipped fast path.
+(48.3 vs 45.3 ms and 134.8 vs 125.9 ms). Three consecutive runs here landed
+within 1% of each other (47.7–48.3 ms and 134.8–138.5 ms), so the difference is
+persistent across this session rather than a single unlucky sample — but the
+baseline was a 20-repeat median against 8 here, no dispersion was recorded on
+either side, and pinned `reference` medians have moved by more than this between
+blocks that shared an OpenBLAS version. One untested hypothesis for it is the
+OpenBLAS bump that came with NumPy 2.5.2 (0.3.33 → 0.3.34); nothing else in the
+environment was held fixed, so that is a guess, not a measurement. `fused` and
+`vulkan` are unchanged. Not filed as a regression — a few percent on the
+slow-path oracle, not on a shipped fast path.
 
 No regressions found; no issues filed.
 
