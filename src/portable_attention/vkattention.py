@@ -28,9 +28,15 @@ from .tiling import TilePlan
 
 __all__ = [
     "AttentionLaunch",
+    "accumulator_slots",
     "attention_launch",
     "attention_spirv",
 ]
+
+#: Output columns one accumulator slot covers when the head dimension is a
+#: multiple of it. Matches the ``vec4`` the shader reads the V tile with, and
+#: :data:`~portable_attention.tiling.VECTOR_LANES`, which prices the tiles.
+VECTOR_COLUMNS = 4
 
 #: Storage buffers the shader binds, in binding order: Q, K, V, output.
 BUFFER_COUNT = 4
@@ -146,7 +152,7 @@ def attention_launch(
         5: block_q * head_dim,  # Q tile
         6: block_k * head_dim,  # K and V tiles
         7: block_q * block_k,  # score tile
-        8: plan.accumulators_per_invocation,
+        8: accumulator_slots(plan),
     }
     groups = (plan.q_tiles(seq_q), stack, 1)
     for axis, (label, count) in enumerate(
@@ -166,6 +172,28 @@ def attention_launch(
         groups=groups,
         plan=plan,
     )
+
+
+def accumulator_slots(plan: TilePlan) -> int:
+    """Accumulator registers one invocation of the shader carries.
+
+    An invocation owns a stripe of the output columns of its query row. When
+    ``head_dim`` is a multiple of :data:`VECTOR_COLUMNS` the stripe is made of
+    whole four-column groups, so the kernel accumulates into ``vec4`` registers
+    and needs a quarter as many slots as it has columns to write; otherwise it
+    owns single columns and the count is
+    :attr:`~portable_attention.tiling.TilePlan.accumulators_per_invocation`.
+
+    Args:
+        plan: The tile plan the pipeline is compiled for.
+
+    Returns:
+        The value of the shader's ``ACC_LEN`` specialization constant.
+    """
+    if plan.head_dim % VECTOR_COLUMNS:
+        return plan.accumulators_per_invocation
+    groups = plan.head_dim // VECTOR_COLUMNS
+    return -(-groups // plan.block_k)
 
 
 def _pack_push_constants(

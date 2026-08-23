@@ -259,7 +259,8 @@ are known and the blocks are capped at the next power of two at or above the
 length, so a short input stops drawing a tile it can never fill. The layout being
 priced is documented on `shared_memory_bytes_for`; a kernel calls it too, so both
 sides bill the same budget. The output accumulator is not in that budget — it is
-register-resident, `plan.accumulators_per_invocation` values per invocation. The
+register-resident, at most `plan.accumulators_per_invocation` values per
+invocation (fewer when a backend vectorizes the columns one invocation owns). The
 Vulkan backend plans every dispatch through it.
 
 The preference order is a hypothesis about hardware, so the feasible set is

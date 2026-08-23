@@ -109,6 +109,55 @@ No regressions found; no issues filed.
 
 ---
 
+## 2026-08-22 — commit b21c70c — vec4 accumulators in the Vulkan kernel
+
+**Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.2. portable-attention
+0.0.1. `OPENBLAS_NUM_THREADS=1` (irrelevant to the device path, held fixed).
+
+**Device:** `V3D 7.1.7.0` (Vulkan 1.2.289), integrated GPU, 16 KiB shared memory
+and 256 invocations per workgroup. Tile plan 16×16 in both columns.
+
+Same session, minutes apart, the only difference being the checkout: `main` at
+b21c70c against the branch for this change. Previously an invocation owned
+output columns `j`, `j + block_k`, ... and read the V tile one float per key
+row; now, when the head dimension is a multiple of four, it owns whole
+four-column groups and reads one `vec4` per key row into a `vec4` accumulator.
+
+### Latency, scalar vs vec4 accumulators (median over 8 repeats)
+
+| shape (B,H,S,D) | vulkan, scalar | vulkan, vec4 acc | speedup |
+|------------------|---------------:|-----------------:|--------:|
+| (1, 1, 64, 32)   |       0.740 ms |         0.901 ms |   0.82× |
+| (1, 8, 128, 64)  |       9.555 ms |         6.630 ms |   1.44× |
+| (2, 8, 256, 64)  |      72.848 ms |        48.526 ms |   1.50× |
+| (1, 12, 512, 64) |     220.057 ms |       145.529 ms |   1.51× |
+
+After the q·k phase was vectorized (2026-08-22, above) the p·v phase held most
+of the remaining shared-memory traffic: `accumulators_per_invocation` × `block_k`
+reads of the V tile per key tile, 64 of them at 16×16 and head_dim=64. Handing
+each lane a four-column group instead of four columns `block_k` apart cuts that
+to 16 reads and keeps adjacent lanes on adjacent addresses.
+
+The smallest shape lost ~0.16 ms and sits inside the run-to-run spread of a
+dispatch that is mostly submission overhead; nothing else regressed.
+
+Two other rearrangements of the same phase were measured on the branch and
+dropped, both slower than the scalar baseline they replaced (223.7 ms on
+(1, 12, 512, 64) in that session):
+
+| variant | (1, 12, 512, 64) |
+|---------|-----------------:|
+| storing the V tile transposed so weights and values are both read four-wide | 258.7 ms |
+| key loop hoisted outside the accumulator loop to reuse each score | 365.1 ms |
+
+The transpose is the one the 2026-08-22 q·k entry proposed. It loses because the
+row-major V tile is already read across lanes, not down a column: with the tile
+transposed each lane strides `block_k` floats instead of landing next to its
+neighbour. Vectorizing the column dimension keeps both properties, which is why
+it is the version that shipped.
+
+---
+
 ## 2026-08-22 — commit 1502c5d — vec4 dot product in the Vulkan kernel
 
 **Environment:** aarch64, 4 CPUs. Python 3.12.13, NumPy 2.5.1. portable-attention
