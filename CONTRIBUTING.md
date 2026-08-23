@@ -70,6 +70,23 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
   ./scripts/vulkan-conformance.sh
 ```
 
+## Editing a shader
+
+The `.spv` modules are committed next to their `.comp` sources and ship in the
+wheel; the suite loads the artifact and never reads the GLSL. Recompiling is a
+manual step, and forgetting it leaves every gate green while the kernel that
+runs is the previous one. After editing a shader, rebuild it with the command
+in the file's header comment, then confirm the tree agrees:
+
+```sh
+./scripts/check-shaders.sh
+```
+
+It recompiles each `.comp` into a temporary file and compares bytes. The
+artifacts here came from glslangValidator 12.0.0 and the script prints the
+version it used; another version may emit a different but equally valid module,
+in which case commit the output you got.
+
 ## Sweeping tile shapes
 
 When a kernel or the sizing policy changes, `scripts/tile-sweep.py` times the
