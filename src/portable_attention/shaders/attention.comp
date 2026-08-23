@@ -9,14 +9,23 @@
 //
 // One workgroup owns BLOCK_Q query rows of one (batch*head) slice and streams
 // the key/value sequence BLOCK_K rows at a time. Invocation (i, j) computes
-// score element (i, j) and owns output columns j, j + BLOCK_K, ... of query
-// row i; those accumulators live in registers, which is why the shared-memory
-// budget in tiling.py has no output tile.
+// score element (i, j) and owns a stripe of the output columns of query row i;
+// those accumulators live in registers, which is why the shared-memory budget
+// in tiling.py has no output tile.
 //
 // The Q/K/V tiles are declared as vec4 arrays: a head dimension that is a
 // multiple of four keeps each row vector-aligned, so the q.k dot product reads
 // four elements per shared-memory access instead of one. Other head dimensions
 // take the scalar loop over the same storage; both index it through TILE_AT.
+//
+// The same alignment decides how output columns are handed out. When HEAD_DIM
+// is a multiple of four an invocation owns whole four-column groups (columns
+// 4j .. 4j+3, then four more BLOCK_K groups along), so the p.v phase reads one
+// vec4 of the V tile per key row and accumulates into a vec4 register; lanes
+// still read adjacent addresses. Otherwise it owns single columns j,
+// j + BLOCK_K, ... and only the x component of each accumulator is used.
+// ACC_LEN counts the slots either way and the host sizes it for the path the
+// head dimension selects.
 //
 // Every tile shape is a specialization constant, so the plan chosen by
 // plan_tiles() for a device is baked in when the pipeline is built. Compiled
@@ -38,7 +47,8 @@ layout(constant_id = 4) const int HEAD_DIM = 1;
 layout(constant_id = 5) const int Q_TILE_LEN = 1;   // BLOCK_Q * HEAD_DIM
 layout(constant_id = 6) const int KV_TILE_LEN = 1;  // BLOCK_K * HEAD_DIM
 layout(constant_id = 7) const int S_TILE_LEN = 1;   // BLOCK_Q * BLOCK_K
-// Output accumulators one invocation carries: ceil(HEAD_DIM / BLOCK_K).
+// Accumulator slots one invocation carries: four-column groups when HEAD_DIM
+// is a multiple of four, single columns otherwise.
 layout(constant_id = 8) const int ACC_LEN = 1;
 
 layout(std430, set = 0, binding = 0) readonly buffer Query { float value[]; } qBuf;
@@ -94,9 +104,9 @@ void main() {
         rowSumState[row] = 0.0;
     }
 
-    float acc[ACC_LEN];
+    vec4 acc[ACC_LEN];
     for (int c = 0; c < ACC_LEN; ++c) {
-        acc[c] = 0.0;
+        acc[c] = vec4(0.0);
     }
 
     for (uint kStart = 0u; kStart < params.seq_k; kStart += uint(BLOCK_K)) {
@@ -160,15 +170,32 @@ void main() {
         barrier();
 
         float rescale = exp(oldMax - newMax);
-        for (int c = 0; c < ACC_LEN; ++c) {
-            uint col = lane + uint(c) * uint(BLOCK_K);
-            if (col < uint(HEAD_DIM)) {
-                float sum = 0.0;
-                for (int j = 0; j < BLOCK_K; ++j) {
-                    sum += sTile[row * uint(BLOCK_K) + uint(j)]
-                        * TILE_AT(vTile, uint(j) * uint(HEAD_DIM) + col);
+        if (HEAD_DIM % 4 == 0) {
+            // Rows of the V tile are vector-aligned here, so the scalar loop
+            // below is dead code in the built pipeline.
+            const uint vcols = uint(HEAD_DIM) / 4u;
+            for (int c = 0; c < ACC_LEN; ++c) {
+                uint vcol = lane + uint(c) * uint(BLOCK_K);
+                if (vcol < vcols) {
+                    vec4 sum = vec4(0.0);
+                    for (int j = 0; j < BLOCK_K; ++j) {
+                        sum += sTile[row * uint(BLOCK_K) + uint(j)]
+                            * vTile[uint(j) * vcols + vcol];
+                    }
+                    acc[c] = acc[c] * rescale + sum;
                 }
-                acc[c] = acc[c] * rescale + sum;
+            }
+        } else {
+            for (int c = 0; c < ACC_LEN; ++c) {
+                uint col = lane + uint(c) * uint(BLOCK_K);
+                if (col < uint(HEAD_DIM)) {
+                    float sum = 0.0;
+                    for (int j = 0; j < BLOCK_K; ++j) {
+                        sum += sTile[row * uint(BLOCK_K) + uint(j)]
+                            * TILE_AT(vTile, uint(j) * uint(HEAD_DIM) + col);
+                    }
+                    acc[c].x = acc[c].x * rescale + sum;
+                }
             }
         }
         if (lane == 0u) {
@@ -188,11 +215,24 @@ void main() {
     // A row that never saw an allowed key divides 0 by 0; the contract makes
     // its output exactly zero.
     float denom = rowSumState[row];
-    for (int c = 0; c < ACC_LEN; ++c) {
-        uint col = lane + uint(c) * uint(BLOCK_K);
-        if (col < uint(HEAD_DIM)) {
-            oBuf.value[qBase + queryIndex * uint(HEAD_DIM) + col] =
-                denom > 0.0 ? acc[c] / denom : 0.0;
+    const uint outBase = qBase + queryIndex * uint(HEAD_DIM);
+    if (HEAD_DIM % 4 == 0) {
+        const uint vcols = uint(HEAD_DIM) / 4u;
+        for (int c = 0; c < ACC_LEN; ++c) {
+            uint vcol = lane + uint(c) * uint(BLOCK_K);
+            if (vcol < vcols) {
+                vec4 group = denom > 0.0 ? acc[c] / denom : vec4(0.0);
+                for (uint t = 0u; t < 4u; ++t) {
+                    oBuf.value[outBase + vcol * 4u + t] = group[t];
+                }
+            }
+        }
+    } else {
+        for (int c = 0; c < ACC_LEN; ++c) {
+            uint col = lane + uint(c) * uint(BLOCK_K);
+            if (col < uint(HEAD_DIM)) {
+                oBuf.value[outBase + col] = denom > 0.0 ? acc[c].x / denom : 0.0;
+            }
         }
     }
 }

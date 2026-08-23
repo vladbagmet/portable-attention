@@ -19,11 +19,13 @@ import pytest
 from portable_attention import get_backend
 from portable_attention import vkcompute as vc
 from portable_attention.blocked import blocked_attention
-from portable_attention.tiling import V3D_LIMITS, TilePlan, plan_tiles
+from portable_attention.tiling import V3D_LIMITS, TilePlan, plan_tiles, tile_plan_for
 from portable_attention.vkattention import (
     BUFFER_COUNT,
     MAX_GROUPS_PER_AXIS,
     PUSH_CONSTANT_BYTES,
+    VECTOR_COLUMNS,
+    accumulator_slots,
     attention_launch,
     attention_spirv,
 )
@@ -88,9 +90,41 @@ def test_specialization_describes_the_plan() -> None:
     assert spec[5] == plan.block_q * plan.head_dim
     assert spec[6] == plan.block_k * plan.head_dim
     assert spec[7] == plan.block_q * plan.block_k
-    assert spec[8] == plan.accumulators_per_invocation
+    assert spec[8] == accumulator_slots(plan)
     assert launch.invocations_per_group == plan.threads_per_group
     assert launch.plan is plan
+
+
+@pytest.mark.parametrize(
+    ("block_k", "head_dim", "expected"),
+    [
+        (16, 64, 1),  # 16 four-column groups, one per lane
+        (4, 32, 2),  # 8 groups over 4 lanes
+        (8, 64, 2),
+        (16, 4, 1),  # a single group, most lanes idle
+        (16, 13, 1),  # not a multiple of four: single columns, one each
+        (8, 13, 2),
+        (16, 6, 1),
+    ],
+)
+def test_accumulator_slots_cover_the_columns_an_invocation_owns(
+    block_k: int, head_dim: int, expected: int
+) -> None:
+    """Whole four-column groups when the head dimension allows, else columns."""
+    plan = tile_plan_for(4, block_k, head_dim, 4, V3D_LIMITS)
+    slots = accumulator_slots(plan)
+    assert slots == expected
+    columns = VECTOR_COLUMNS if head_dim % VECTOR_COLUMNS == 0 else 1
+    # The last lane's last slot has to reach the final column of the row.
+    assert slots * block_k * columns >= head_dim
+    assert (slots - 1) * block_k * columns < head_dim
+
+
+def test_accumulator_slots_shrink_when_columns_are_vectorized() -> None:
+    """The vec4 path carries a quarter of the scalar path's registers."""
+    plan = tile_plan_for(16, 16, 64, 4, V3D_LIMITS)
+    assert plan.accumulators_per_invocation == 4
+    assert accumulator_slots(plan) == 1
 
 
 def test_groups_cover_the_query_rows_of_every_slice() -> None:
