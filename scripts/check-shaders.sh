@@ -29,6 +29,15 @@ cd "$(dirname "$0")/.."
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Enumerate first rather than piping into the loop: a `find` inside a process
+# substitution fails silently, and an unreadable tree would then look like a
+# clean run over the files it did manage to list.
+sources="$tmp/sources"
+if ! find src tests -name '*.comp' | sort >"$sources"; then
+  echo "could not enumerate shader sources under src/ and tests/" >&2
+  exit 1
+fi
+
 status=0
 while IFS= read -r comp; do
   spv="${comp%.comp}.spv"
@@ -50,6 +59,6 @@ while IFS= read -r comp; do
     echo "STALE    $spv differs from a fresh compile of $comp" >&2
     status=1
   fi
-done < <(find src tests -name '*.comp' | sort)
+done <"$sources"
 
 exit "$status"
