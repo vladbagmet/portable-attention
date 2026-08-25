@@ -55,7 +55,9 @@ attention: pass `enable_gqa=True` when `key`/`value` carry fewer heads than
 signature compatibility but must be left at `0.0` (a non-zero value raises
 `NotImplementedError` rather than being silently ignored). The public API is the
 set of names re-exported from the top-level package (its `__all__`):
-`scaled_dot_product_attention`, `__version__`, the backend-registry helpers
+`scaled_dot_product_attention`, its gradient
+`scaled_dot_product_attention_backward` (see [Gradients](#gradients)),
+`__version__`, the backend-registry helpers
 `get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
 protocol, the conformance kit `assert_conforms`, `check_backend`,
 `conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
@@ -363,6 +365,40 @@ results = check_backend(my_backend)  # structured per-case results to inspect
 `conformance_cases()` returns the case list as data, so you can parametrize a
 test suite over it (`ConformanceCase` / `ConformanceResult` are the public
 types).
+
+## Gradients
+
+Training needs the backward pass as well, so the CPU oracle ships one:
+`scaled_dot_product_attention_backward` takes the upstream gradient followed by
+the same arguments the forward call got, and returns `(dq, dk, dv)`.
+
+```python
+import numpy as np
+from portable_attention import (
+    scaled_dot_product_attention,
+    scaled_dot_product_attention_backward,
+)
+
+out = scaled_dot_product_attention(query, key, value, is_causal=True)
+grad_out = np.ones_like(out)  # dL/dout from the layer above
+dq, dk, dv = scaled_dot_product_attention_backward(
+    grad_out, query, key, value, is_causal=True
+)
+```
+
+Each gradient comes back with the shape and dtype of its input, summed over any
+axis the forward pass broadcast (a shared key/value across a batch, say) and
+folded back onto the key/value heads under `enable_gqa=True`. Masked positions
+and fully-masked rows contribute nothing, so causal and boolean-masked calls
+need no special handling. There is no `dropout_p` parameter — the forward pass
+supports only `0.0` — and gradients with respect to `attn_mask` are not
+returned.
+
+This is deliberately a plain function, not a framework integration: it holds no
+state and imports nothing beyond NumPy, so it can sit inside whatever autograd
+machinery you already have (a `torch.autograd.Function`, a JAX custom VJP, or a
+hand-rolled tape). It is checked against central finite differences of the
+forward oracle across the same contract matrix the forward suite covers.
 
 ## CPU performance and BLAS threads
 

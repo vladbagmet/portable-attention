@@ -51,6 +51,7 @@ def test_public_exports_are_frozen():
         "register_backend",
         "register_vulkan_backend",
         "scaled_dot_product_attention",
+        "scaled_dot_product_attention_backward",
         "shared_memory_bytes_for",
         "tile_plan_for",
         "vulkan_available",

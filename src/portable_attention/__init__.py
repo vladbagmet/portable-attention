@@ -16,6 +16,11 @@ backend must pass the shared conformance kit (:func:`assert_conforms`,
 developer-parity promise: identical behaviour against the reference oracle
 across the documented contract matrix.
 
+Training needs the other half of the op: :func:`scaled_dot_product_attention_backward`
+is the CPU oracle for the gradients, returning ``(dq, dk, dv)`` for the same
+argument list the forward pass takes, so the layer can be wrapped in whatever
+autograd machinery a caller already has.
+
 Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
 :class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
 shared-memory / workgroup / SIMD numbers instead of a second hand-tuned kernel.
@@ -36,6 +41,7 @@ registration.
 
 from __future__ import annotations
 
+from .backward import scaled_dot_product_attention_backward
 from .blocked import blocked_attention
 from .conformance import (
     ConformanceCase,
@@ -91,6 +97,7 @@ __all__ = [
     "register_backend",
     "register_vulkan_backend",
     "scaled_dot_product_attention",
+    "scaled_dot_product_attention_backward",
     "shared_memory_bytes_for",
     "tile_plan_for",
     "vulkan_available",
