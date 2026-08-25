@@ -205,6 +205,17 @@ def test_unbatched_query_against_batched_key_reduces_leading_axis() -> None:
     _check_against_finite_differences(query, key, value, grad_output)
 
 
+def test_value_only_batch_axis_still_backpropagates() -> None:
+    """A batched value against a 2-D query/key: the output batch comes from V."""
+    rng = np.random.default_rng(16)
+    query = _random(rng, 3, 4)
+    key = _random(rng, 5, 4)
+    value = _random(rng, 2, 5, 4)
+    grad_output = _random(rng, 2, 3, 4)
+    assert scaled_dot_product_attention(query, key, value).shape == grad_output.shape
+    _check_against_finite_differences(query, key, value, grad_output)
+
+
 def test_fully_masked_rows_have_zero_gradient() -> None:
     rng = np.random.default_rng(9)
     query, key, value = _random(rng, 2, 4), _random(rng, 3, 4), _random(rng, 3, 4)

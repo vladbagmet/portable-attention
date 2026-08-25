@@ -125,7 +125,11 @@ def scaled_dot_product_attention_backward(
         query, key, value, attn_mask, is_causal, enable_gqa
     )
     weights = attention_weights(query, expanded_key, attn_mask, is_causal, scale)
-    expected = (*weights.shape[:-1], expanded_value.shape[-1])
+    # The forward output is P @ V, so its batch axes are the broadcast of the
+    # weights' and the value's — the value alone may carry a batch axis the
+    # weights do not have (a 2-D query and key against a batched value).
+    batch = np.broadcast_shapes(weights.shape[:-2], expanded_value.shape[:-2])
+    expected = (*batch, weights.shape[-2], expanded_value.shape[-1])
     if grad_output.shape != expected:
         raise ValueError(
             f"grad_output has shape {grad_output.shape}, but the forward output "
