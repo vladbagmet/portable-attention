@@ -67,7 +67,10 @@ reproducible benchmark harness.
   tile-reuse-bound; 2026-08-22 vectorized q·k, 1.85× on the kernel, then vec4
   output accumulators, a further 1.5×)*
 - Optional autograd hook (backward pass) so the layer becomes training-usable on
-  the Vulkan path.
+  the Vulkan path. *(CPU half done:
+  `scaled_dot_product_attention_backward` is the gradient oracle, checked
+  against finite differences of the forward pass; the device kernel and the
+  per-backend hook still to come.)*
 
 Kernel design has to fit the V3D (VideoCore VII) device limits measured on the
 reference board — a flash-style tile must live within 16 KiB of shared memory at

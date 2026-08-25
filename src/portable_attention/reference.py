@@ -53,6 +53,99 @@ def _expand_kv_for_gqa(query: Array, key: Array, value: Array) -> tuple[Array, A
     return np.repeat(key, repeats, axis=-3), np.repeat(value, repeats, axis=-3)
 
 
+def validate_inputs(
+    query: Array,
+    key: Array,
+    value: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None,
+    is_causal: bool,
+    enable_gqa: bool,
+) -> tuple[Array, Array]:
+    """Check the shape/argument contract and expand key/value for GQA.
+
+    Shared by the forward pass and the backward pass so both accept exactly the
+    same inputs and reject the same ones with the same messages.
+
+    Returns:
+        The ``(key, value)`` pair to attend with — the originals, or their
+        head-expanded views when ``enable_gqa`` is set.
+
+    Raises:
+        ValueError: On incompatible shapes, ``is_causal`` combined with
+            ``attn_mask``, or an invalid grouped-query head configuration.
+    """
+    if is_causal and attn_mask is not None:
+        raise ValueError("Pass either is_causal=True or attn_mask, not both.")
+    if query.ndim < 2 or key.ndim < 2 or value.ndim < 2:
+        raise ValueError("query, key, and value must each have at least 2 dims.")
+    if enable_gqa:
+        key, value = _expand_kv_for_gqa(query, key, value)
+    if query.shape[-1] != key.shape[-1]:
+        raise ValueError(
+            f"query/key embedding dims differ: {query.shape[-1]} vs {key.shape[-1]}."
+        )
+    if key.shape[-2] != value.shape[-2]:
+        raise ValueError(
+            f"key/value sequence dims differ: {key.shape[-2]} vs {value.shape[-2]}."
+        )
+    return key, value
+
+
+def default_scale(query: Array) -> float:
+    """Return the softmax scale used when the caller passes ``scale=None``."""
+    return float(1.0 / np.sqrt(query.shape[-1]))
+
+
+def attention_weights(
+    query: Array,
+    key: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None,
+    is_causal: bool,
+    scale: float | None,
+) -> NDArray[np.float64]:
+    """Return the float64 softmax attention weights for validated inputs.
+
+    This is the oracle's softmax, factored out so the backward pass recomputes
+    exactly the probabilities the forward pass produced instead of a second,
+    subtly different formulation. Inputs must already have passed
+    :func:`validate_inputs`; ``key`` must already be head-expanded for GQA.
+
+    Fully-masked rows (every score ``-inf``) return a row of exact zeros rather
+    than ``nan``.
+    """
+    scale_val = default_scale(query) if scale is None else scale
+
+    # Compute in float64 for a stable oracle regardless of input dtype.
+    q = query.astype(np.float64)
+    k = key.astype(np.float64)
+
+    scores = np.matmul(q, np.swapaxes(k, -1, -2)) * scale_val
+
+    if is_causal:
+        length, source = scores.shape[-2], scores.shape[-1]
+        causal = np.tril(np.ones((length, source), dtype=bool))
+        scores = np.where(causal, scores, -np.inf)
+    elif attn_mask is not None:
+        if attn_mask.dtype == np.bool_:
+            scores = np.where(attn_mask, scores, -np.inf)
+        else:
+            scores = scores + attn_mask.astype(np.float64)
+
+    # Subtract the per-row max for numerical stability. A fully-masked row is
+    # all -inf, whose max is -inf; avoid the -inf - -inf = nan trap by shifting
+    # such rows by 0 (they still exp() to 0 and get zeroed by the divide guard).
+    row_max = np.max(scores, axis=-1, keepdims=True)
+    row_max = np.where(np.isfinite(row_max), row_max, 0.0)
+    scores = scores - row_max
+    weights = np.exp(scores)
+    denom = np.sum(weights, axis=-1, keepdims=True)
+    # Rows fully masked to -inf yield 0/0; define their output as 0.
+    normalized: NDArray[np.float64] = np.divide(
+        weights, denom, out=np.zeros_like(weights), where=denom > 0
+    )
+    return normalized
+
+
 def scaled_dot_product_attention(
     query: Array,
     key: Array,
@@ -112,52 +205,9 @@ def scaled_dot_product_attention(
             "dropout_p is not supported by the CPU reference backend; "
             "pass dropout_p=0.0."
         )
-    if is_causal and attn_mask is not None:
-        raise ValueError("Pass either is_causal=True or attn_mask, not both.")
-    if query.ndim < 2 or key.ndim < 2 or value.ndim < 2:
-        raise ValueError("query, key, and value must each have at least 2 dims.")
-    if enable_gqa:
-        key, value = _expand_kv_for_gqa(query, key, value)
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError(
-            f"query/key embedding dims differ: {query.shape[-1]} vs {key.shape[-1]}."
-        )
-    if key.shape[-2] != value.shape[-2]:
-        raise ValueError(
-            f"key/value sequence dims differ: {key.shape[-2]} vs {value.shape[-2]}."
-        )
-
-    e = query.shape[-1]
-    if scale is None:
-        scale = 1.0 / np.sqrt(e)
-
-    # Compute in float64 for a stable oracle regardless of input dtype.
-    q = query.astype(np.float64)
-    k = key.astype(np.float64)
+    key, value = validate_inputs(query, key, value, attn_mask, is_causal, enable_gqa)
+    weights = attention_weights(query, key, attn_mask, is_causal, scale)
     v = value.astype(np.float64)
-
-    scores = np.matmul(q, np.swapaxes(k, -1, -2)) * scale
-
-    if is_causal:
-        length, source = scores.shape[-2], scores.shape[-1]
-        causal = np.tril(np.ones((length, source), dtype=bool))
-        scores = np.where(causal, scores, -np.inf)
-    elif attn_mask is not None:
-        if attn_mask.dtype == np.bool_:
-            scores = np.where(attn_mask, scores, -np.inf)
-        else:
-            scores = scores + attn_mask.astype(np.float64)
-
-    # Subtract the per-row max for numerical stability. A fully-masked row is
-    # all -inf, whose max is -inf; avoid the -inf - -inf = nan trap by shifting
-    # such rows by 0 (they still exp() to 0 and get zeroed by the divide guard).
-    row_max = np.max(scores, axis=-1, keepdims=True)
-    row_max = np.where(np.isfinite(row_max), row_max, 0.0)
-    scores = scores - row_max
-    weights = np.exp(scores)
-    denom = np.sum(weights, axis=-1, keepdims=True)
-    # Rows fully masked to -inf yield 0/0; define their output as 0.
-    weights = np.divide(weights, denom, out=np.zeros_like(weights), where=denom > 0)
 
     out: Array = np.matmul(weights, v).astype(query.dtype)
     return out
