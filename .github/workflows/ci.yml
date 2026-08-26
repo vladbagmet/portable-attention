@@ -104,10 +104,12 @@ jobs:
         run: |
           uv venv --python 3.12
           uv pip install dist/*.whl
-          uv run python -c "import portable_attention as pa; print(pa.__version__)"
+          # Not `uv run`: it would sync the project and import the editable
+          # checkout instead of the wheel just installed into .venv.
+          .venv/bin/python -c "import portable_attention as pa; print(pa.__version__)"
       - name: Check the installed wheel carries the compiled shader
         run: |
-          uv run python - <<'PY'
+          .venv/bin/python - <<'PY'
           from portable_attention.vkattention import attention_spirv
 
           spirv = attention_spirv()
