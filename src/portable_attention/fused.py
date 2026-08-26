@@ -38,7 +38,13 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["scaled_dot_product_attention"]
+from .backward import expected_output_shape, fold_gqa_heads, sum_to_shape
+from .reference import validate_inputs
+
+__all__ = [
+    "scaled_dot_product_attention",
+    "scaled_dot_product_attention_backward",
+]
 
 Array = NDArray[np.floating]
 
@@ -48,41 +54,6 @@ Array = NDArray[np.floating]
 _BLAS_THREADS = 1
 
 
-def _expand_kv_for_gqa(query: Array, key: Array, value: Array) -> tuple[Array, Array]:
-    """Repeat key/value heads to match query heads for grouped-query attention.
-
-    Under grouped-query attention the query carries ``H_q`` heads while key and
-    value share ``H_kv`` heads, with ``H_q`` a positive multiple of ``H_kv``;
-    each group of ``H_q // H_kv`` query heads attends to one key/value head. The
-    head axis is ``-3`` (inputs shaped ``(*, H, S, E)``), so each key/value head
-    is repeated in place along that axis, matching ``torch``'s
-    ``repeat_interleave`` grouping. The repeat preserves dtype.
-
-    Raises:
-        ValueError: If any input lacks a head axis (fewer than 3 dims), the key
-            and value head counts differ, or ``H_q`` is not a positive multiple
-            of ``H_kv``.
-    """
-    if query.ndim < 3 or key.ndim < 3 or value.ndim < 3:
-        raise ValueError(
-            "enable_gqa=True requires a head dimension: query, key, and value "
-            "must each have at least 3 dims (*, H, S, E)."
-        )
-    q_heads = query.shape[-3]
-    k_heads = key.shape[-3]
-    if k_heads != value.shape[-3]:
-        raise ValueError(f"key/value head dims differ: {k_heads} vs {value.shape[-3]}.")
-    if q_heads == 0 or k_heads == 0 or q_heads % k_heads != 0:
-        raise ValueError(
-            f"query head count {q_heads} must be a positive multiple of the "
-            f"key/value head count {k_heads} for grouped-query attention."
-        )
-    repeats = q_heads // k_heads
-    if repeats == 1:
-        return key, value
-    return np.repeat(key, repeats, axis=-3), np.repeat(value, repeats, axis=-3)
-
-
 def _threadpoolctl() -> ModuleType | None:
     """Import the optional ``threadpoolctl`` module, or ``None`` if absent."""
     if importlib.util.find_spec("threadpoolctl") is None:
@@ -90,6 +61,69 @@ def _threadpoolctl() -> ModuleType | None:
     import threadpoolctl
 
     return threadpoolctl
+
+
+def _compute_dtype(
+    operands: tuple[Array, ...],
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None,
+) -> np.dtype[Any]:
+    """Pick the arithmetic dtype: the widest operand, at least ``float32``.
+
+    Computing in the widest floating precision among all operands preserves
+    precision for mixed-dtype inputs instead of silently downcasting to
+    ``query``'s dtype; the ``float32`` floor keeps a ``float16`` softmax
+    numerically safe. A boolean mask carries no precision and is ignored.
+    """
+    dtypes: list[np.dtype[Any]] = [operand.dtype for operand in operands]
+    if attn_mask is not None and attn_mask.dtype != np.bool_:
+        dtypes.append(attn_mask.dtype)
+    return np.result_type(*dtypes, np.float32)
+
+
+def _softmax_weights(
+    query: Array,
+    key: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None,
+    is_causal: bool,
+    scale: float,
+    compute_dtype: np.dtype[Any],
+) -> Array:
+    """Return the attention probabilities in ``compute_dtype``.
+
+    ``query`` and ``key`` must already be validated, head-expanded, and cast to
+    ``compute_dtype``. Factored out so the backward pass differentiates the same
+    probabilities the forward pass computes rather than a second, subtly
+    different formulation.
+    """
+    scores = np.matmul(query, np.swapaxes(key, -1, -2)) * scale
+
+    if is_causal:
+        length, source = scores.shape[-2], scores.shape[-1]
+        keep = np.tril(np.ones((length, source), dtype=bool))
+        scores = np.where(keep, scores, -np.inf)
+    elif attn_mask is not None:
+        if attn_mask.dtype == np.bool_:
+            scores = np.where(attn_mask, scores, -np.inf)
+        else:
+            scores = scores + attn_mask.astype(compute_dtype)
+
+    # Shift by the per-row max for stability; a fully-masked row is all
+    # -inf (max -inf), so shift those rows by 0 to avoid -inf - -inf = nan.
+    row_max = np.max(scores, axis=-1, keepdims=True)
+    row_max = np.where(np.isfinite(row_max), row_max, 0.0)
+    scores = scores - row_max
+    weights = np.exp(scores)
+    denom = np.sum(weights, axis=-1, keepdims=True)
+    # Fully-masked rows have denom 0; define their output as exactly 0.
+    normalized: Array = np.divide(
+        weights, denom, out=np.zeros_like(weights), where=denom > 0
+    )
+    return normalized
+
+
+def _slice_count(array: Array) -> int:
+    """Number of batched GEMM slices: the product of the leading dims."""
+    return int(np.prod(array.shape[:-2])) if array.ndim > 2 else 1
 
 
 @contextmanager
@@ -156,63 +190,98 @@ def scaled_dot_product_attention(
         raise NotImplementedError(
             "dropout_p is not supported by the fused CPU backend; pass dropout_p=0.0."
         )
-    if is_causal and attn_mask is not None:
-        raise ValueError("Pass either is_causal=True or attn_mask, not both.")
-    if query.ndim < 2 or key.ndim < 2 or value.ndim < 2:
-        raise ValueError("query, key, and value must each have at least 2 dims.")
-    if enable_gqa:
-        key, value = _expand_kv_for_gqa(query, key, value)
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError(
-            f"query/key embedding dims differ: {query.shape[-1]} vs {key.shape[-1]}."
-        )
-    if key.shape[-2] != value.shape[-2]:
-        raise ValueError(
-            f"key/value sequence dims differ: {key.shape[-2]} vs {value.shape[-2]}."
-        )
-
-    # Compute in the widest floating precision among all operands (query, key,
-    # value, and an additive mask), promoting float16 up to float32 so the
-    # softmax stays numerically safe. This preserves precision for mixed-dtype
-    # inputs instead of silently downcasting to query's dtype.
-    operand_dtypes: list[np.dtype[Any]] = [query.dtype, key.dtype, value.dtype]
-    if attn_mask is not None and attn_mask.dtype != np.bool_:
-        operand_dtypes.append(attn_mask.dtype)
-    compute_dtype = np.result_type(*operand_dtypes, np.float32)
+    key, value = validate_inputs(query, key, value, attn_mask, is_causal, enable_gqa)
+    compute_dtype = _compute_dtype((query, key, value), attn_mask)
     q = query.astype(compute_dtype, copy=False)
     k = key.astype(compute_dtype, copy=False)
     v = value.astype(compute_dtype, copy=False)
 
-    e = q.shape[-1]
     # Keep the scale a plain Python float so it does not (under NEP 50) upcast a
     # float32 score array back to float64.
-    scale_val: float = float(1.0 / np.sqrt(e)) if scale is None else scale
+    scale_val: float = float(1.0 / np.sqrt(q.shape[-1])) if scale is None else scale
 
-    # Number of batched GEMM slices = product of the leading (non-matrix) dims.
-    slices = int(np.prod(q.shape[:-2])) if q.ndim > 2 else 1
-    with _single_thread_blas(pin=slices > 1):
-        scores = np.matmul(q, np.swapaxes(k, -1, -2)) * scale_val
-
-        if is_causal:
-            length, source = scores.shape[-2], scores.shape[-1]
-            keep = np.tril(np.ones((length, source), dtype=bool))
-            scores = np.where(keep, scores, -np.inf)
-        elif attn_mask is not None:
-            if attn_mask.dtype == np.bool_:
-                scores = np.where(attn_mask, scores, -np.inf)
-            else:
-                scores = scores + attn_mask.astype(compute_dtype)
-
-        # Shift by the per-row max for stability; a fully-masked row is all
-        # -inf (max -inf), so shift those rows by 0 to avoid -inf - -inf = nan.
-        row_max = np.max(scores, axis=-1, keepdims=True)
-        row_max = np.where(np.isfinite(row_max), row_max, 0.0)
-        scores = scores - row_max
-        weights = np.exp(scores)
-        denom = np.sum(weights, axis=-1, keepdims=True)
-        # Fully-masked rows have denom 0; define their output as exactly 0.
-        weights = np.divide(weights, denom, out=np.zeros_like(weights), where=denom > 0)
+    with _single_thread_blas(pin=_slice_count(q) > 1):
+        weights = _softmax_weights(q, k, attn_mask, is_causal, scale_val, compute_dtype)
         attended = np.matmul(weights, v)
 
     out: Array = attended.astype(query.dtype, copy=False)
     return out
+
+
+def scaled_dot_product_attention_backward(
+    grad_output: Array,
+    query: Array,
+    key: Array,
+    value: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+    is_causal: bool = False,
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> tuple[Array, Array, Array]:
+    """Compute the gradients of this backend's forward pass.
+
+    Same vector-Jacobian product as
+    :func:`portable_attention.backward.scaled_dot_product_attention_backward`
+    (see it for the derivation and the argument contract), evaluated in the
+    native compute precision with BLAS pinned, so a training loop keeps the
+    forward pass's precision and threading behaviour on the way back. The
+    probabilities are recomputed from the inputs, sharing the forward pass's
+    softmax.
+
+    Args:
+        grad_output: Upstream gradient, shaped like the forward output.
+        query: Query tensor of shape ``(*, L, E)``.
+        key: Key tensor of shape ``(*, S, E)``.
+        value: Value tensor of shape ``(*, S, Ev)``.
+        attn_mask: The mask the forward pass used, if any.
+        is_causal: Whether the forward pass applied a causal mask.
+        scale: Softmax scale (keyword-only). Defaults to ``1 / sqrt(E)``.
+        enable_gqa: Whether the forward pass ran grouped-query attention.
+
+    Returns:
+        ``(dq, dk, dv)``, each shaped like — and carrying the dtype of — the
+        corresponding input.
+
+    Raises:
+        ValueError: On the same input violations the forward pass rejects, or if
+            ``grad_output`` does not match the forward output's shape.
+    """
+    expanded_key, expanded_value = validate_inputs(
+        query, key, value, attn_mask, is_causal, enable_gqa
+    )
+    compute_dtype = _compute_dtype(
+        (grad_output, query, expanded_key, expanded_value), attn_mask
+    )
+    g = grad_output.astype(compute_dtype, copy=False)
+    q = query.astype(compute_dtype, copy=False)
+    k = expanded_key.astype(compute_dtype, copy=False)
+    v = expanded_value.astype(compute_dtype, copy=False)
+    scale_val: float = float(1.0 / np.sqrt(q.shape[-1])) if scale is None else scale
+
+    with _single_thread_blas(pin=_slice_count(q) > 1):
+        weights = _softmax_weights(q, k, attn_mask, is_causal, scale_val, compute_dtype)
+        expected = expected_output_shape(weights, v)
+        if g.shape != expected:
+            raise ValueError(
+                f"grad_output has shape {grad_output.shape}, but the forward "
+                f"output for these inputs has shape {expected}."
+            )
+
+        # dV = Pᵀ @ g, dP = g @ Vᵀ, and dS = P ⊙ (dP − Σ(dP ⊙ P)). Masked
+        # entries and fully-masked rows have P = 0 and drop out on their own.
+        grad_value = np.matmul(np.swapaxes(weights, -1, -2), g)
+        grad_weights = np.matmul(g, np.swapaxes(v, -1, -2))
+        row_dot = np.sum(grad_weights * weights, axis=-1, keepdims=True)
+        grad_scores = weights * (grad_weights - row_dot)
+        grad_query = np.matmul(grad_scores, k) * scale_val
+        grad_key = np.matmul(np.swapaxes(grad_scores, -1, -2), q) * scale_val
+
+    if enable_gqa:
+        grad_key = fold_gqa_heads(grad_key, key.shape[-3])
+        grad_value = fold_gqa_heads(grad_value, value.shape[-3])
+
+    dq: Array = sum_to_shape(grad_query, query.shape).astype(query.dtype)
+    dk: Array = sum_to_shape(grad_key, key.shape).astype(key.dtype)
+    dv: Array = sum_to_shape(grad_value, value.shape).astype(value.dtype)
+    return dq, dk, dv
