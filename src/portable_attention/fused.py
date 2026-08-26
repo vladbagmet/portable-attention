@@ -39,6 +39,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .backward import expected_output_shape, fold_gqa_heads, sum_to_shape
+from .reference import validate_inputs
 
 __all__ = [
     "scaled_dot_product_attention",
@@ -53,41 +54,6 @@ Array = NDArray[np.floating]
 _BLAS_THREADS = 1
 
 
-def _expand_kv_for_gqa(query: Array, key: Array, value: Array) -> tuple[Array, Array]:
-    """Repeat key/value heads to match query heads for grouped-query attention.
-
-    Under grouped-query attention the query carries ``H_q`` heads while key and
-    value share ``H_kv`` heads, with ``H_q`` a positive multiple of ``H_kv``;
-    each group of ``H_q // H_kv`` query heads attends to one key/value head. The
-    head axis is ``-3`` (inputs shaped ``(*, H, S, E)``), so each key/value head
-    is repeated in place along that axis, matching ``torch``'s
-    ``repeat_interleave`` grouping. The repeat preserves dtype.
-
-    Raises:
-        ValueError: If any input lacks a head axis (fewer than 3 dims), the key
-            and value head counts differ, or ``H_q`` is not a positive multiple
-            of ``H_kv``.
-    """
-    if query.ndim < 3 or key.ndim < 3 or value.ndim < 3:
-        raise ValueError(
-            "enable_gqa=True requires a head dimension: query, key, and value "
-            "must each have at least 3 dims (*, H, S, E)."
-        )
-    q_heads = query.shape[-3]
-    k_heads = key.shape[-3]
-    if k_heads != value.shape[-3]:
-        raise ValueError(f"key/value head dims differ: {k_heads} vs {value.shape[-3]}.")
-    if q_heads == 0 or k_heads == 0 or q_heads % k_heads != 0:
-        raise ValueError(
-            f"query head count {q_heads} must be a positive multiple of the "
-            f"key/value head count {k_heads} for grouped-query attention."
-        )
-    repeats = q_heads // k_heads
-    if repeats == 1:
-        return key, value
-    return np.repeat(key, repeats, axis=-3), np.repeat(value, repeats, axis=-3)
-
-
 def _threadpoolctl() -> ModuleType | None:
     """Import the optional ``threadpoolctl`` module, or ``None`` if absent."""
     if importlib.util.find_spec("threadpoolctl") is None:
@@ -95,38 +61,6 @@ def _threadpoolctl() -> ModuleType | None:
     import threadpoolctl
 
     return threadpoolctl
-
-
-def _validate_and_expand(
-    query: Array,
-    key: Array,
-    value: Array,
-    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None,
-    is_causal: bool,
-    enable_gqa: bool,
-) -> tuple[Array, Array]:
-    """Check the shape/argument contract and expand key/value for GQA.
-
-    Shared by this backend's forward and backward passes so both accept exactly
-    the same inputs and reject the same ones with the same messages. Returns the
-    ``(key, value)`` pair to attend with: the originals, or their head-expanded
-    views when ``enable_gqa`` is set.
-    """
-    if is_causal and attn_mask is not None:
-        raise ValueError("Pass either is_causal=True or attn_mask, not both.")
-    if query.ndim < 2 or key.ndim < 2 or value.ndim < 2:
-        raise ValueError("query, key, and value must each have at least 2 dims.")
-    if enable_gqa:
-        key, value = _expand_kv_for_gqa(query, key, value)
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError(
-            f"query/key embedding dims differ: {query.shape[-1]} vs {key.shape[-1]}."
-        )
-    if key.shape[-2] != value.shape[-2]:
-        raise ValueError(
-            f"key/value sequence dims differ: {key.shape[-2]} vs {value.shape[-2]}."
-        )
-    return key, value
 
 
 def _compute_dtype(
@@ -256,9 +190,7 @@ def scaled_dot_product_attention(
         raise NotImplementedError(
             "dropout_p is not supported by the fused CPU backend; pass dropout_p=0.0."
         )
-    key, value = _validate_and_expand(
-        query, key, value, attn_mask, is_causal, enable_gqa
-    )
+    key, value = validate_inputs(query, key, value, attn_mask, is_causal, enable_gqa)
     compute_dtype = _compute_dtype((query, key, value), attn_mask)
     q = query.astype(compute_dtype, copy=False)
     k = key.astype(compute_dtype, copy=False)
@@ -315,7 +247,7 @@ def scaled_dot_product_attention_backward(
         ValueError: On the same input violations the forward pass rejects, or if
             ``grad_output`` does not match the forward output's shape.
     """
-    expanded_key, expanded_value = _validate_and_expand(
+    expanded_key, expanded_value = validate_inputs(
         query, key, value, attn_mask, is_causal, enable_gqa
     )
     compute_dtype = _compute_dtype(
