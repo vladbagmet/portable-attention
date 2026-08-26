@@ -21,6 +21,17 @@ single-slice inputs on the ``reference`` oracle path (where the two perform
 equivalently). This is where the selection policy lives as vendor backends
 land.
 
+A backend may also implement the *backward* pass by exposing a ``backward``
+attribute (see :class:`TrainableSdpaBackend`); both CPU backends do. That half
+of the contract is optional — an inference-only backend is complete — so ask
+before using it::
+
+    from portable_attention import backward_for, get_backend, supports_backward
+
+    backend = get_backend("auto")
+    if supports_backward(backend):
+        dq, dk, dv = backward_for(backend)(grad_output, query, key, value)
+
 The CPU ``fused`` backend computes the same forward attention as ``reference``
 but in the input's native precision, with BLAS pinned to a single thread for
 batched (multi-slice) inputs, which removes the multi-head latency cliff the
@@ -31,20 +42,27 @@ it automatically for batched work; select it unconditionally with
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .backward import scaled_dot_product_attention_backward as _reference_backward
 from .fused import scaled_dot_product_attention as _fused_sdpa
+from .fused import scaled_dot_product_attention_backward as _fused_backward
 from .reference import scaled_dot_product_attention as _reference_sdpa
 
 __all__ = [
     "SdpaBackend",
+    "SdpaBackward",
+    "TrainableSdpaBackend",
     "available_backends",
+    "backward_for",
     "get_backend",
     "register_backend",
     "scaled_dot_product_attention",
+    "supports_backward",
+    "with_backward",
 ]
 
 Array = NDArray[np.floating]
@@ -74,6 +92,173 @@ class SdpaBackend(Protocol):
     ) -> Array:
         """Compute scaled dot-product attention. See the public function."""
         ...
+
+
+@runtime_checkable
+class SdpaBackward(Protocol):
+    """Structural contract for a backend's optional gradient entry point.
+
+    The parameters after ``grad_output`` mirror the forward call's and describe
+    the same call; ``dropout_p`` has no counterpart because the forward contract
+    supports only ``0.0``. See
+    :func:`portable_attention.backward.scaled_dot_product_attention_backward`
+    for the reference semantics every implementation is checked against.
+    """
+
+    def __call__(
+        self,
+        grad_output: Array,
+        query: Array,
+        key: Array,
+        value: Array,
+        attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = ...,
+        is_causal: bool = ...,
+        *,
+        scale: float | None = ...,
+        enable_gqa: bool = ...,
+    ) -> tuple[Array, Array, Array]:
+        """Return ``(dq, dk, dv)`` for the given upstream gradient."""
+        ...
+
+
+@runtime_checkable
+class TrainableSdpaBackend(SdpaBackend, Protocol):
+    """An :class:`SdpaBackend` that also implements the backward pass.
+
+    Backward support is *optional*: an inference-only backend is a complete,
+    conforming backend. A backend opts in by exposing a ``backward`` attribute
+    satisfying :class:`SdpaBackward` — a method on a class-based backend, or
+    :func:`with_backward` for a pair of plain functions. Use
+    :func:`supports_backward` to test a backend and :func:`backward_for` to
+    reach its gradient entry point.
+    """
+
+    def backward(
+        self,
+        grad_output: Array,
+        query: Array,
+        key: Array,
+        value: Array,
+        attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = ...,
+        is_causal: bool = ...,
+        *,
+        scale: float | None = ...,
+        enable_gqa: bool = ...,
+    ) -> tuple[Array, Array, Array]:
+        """Return ``(dq, dk, dv)``. See :class:`SdpaBackward`."""
+        ...
+
+
+class _PairedBackend:
+    """A forward callable and its backward, bound into one backend object.
+
+    Function-style backends (the CPU ``reference`` and ``fused`` ones included)
+    cannot carry a ``backward`` method, so :func:`with_backward` pairs them here
+    instead. Both halves are forwarded with explicit signatures, so the object
+    is an ordinary :class:`TrainableSdpaBackend` with no argument reshuffling.
+    """
+
+    def __init__(self, forward: SdpaBackend, backward: SdpaBackward) -> None:
+        self._forward = forward
+        self._backward = backward
+
+    def __call__(
+        self,
+        query: Array,
+        key: Array,
+        value: Array,
+        attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        *,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> Array:
+        return self._forward(
+            query,
+            key,
+            value,
+            attn_mask,
+            dropout_p,
+            is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    def backward(
+        self,
+        grad_output: Array,
+        query: Array,
+        key: Array,
+        value: Array,
+        attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+        is_causal: bool = False,
+        *,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> tuple[Array, Array, Array]:
+        return self._backward(
+            grad_output,
+            query,
+            key,
+            value,
+            attn_mask,
+            is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    def __repr__(self) -> str:
+        name = getattr(self._forward, "__name__", repr(self._forward))
+        return f"<trainable backend {name}>"
+
+
+def with_backward(forward: SdpaBackend, backward: SdpaBackward) -> TrainableSdpaBackend:
+    """Bind a forward function and a backward function into one backend.
+
+    Args:
+        forward: The forward callable (an :class:`SdpaBackend`).
+        backward: Its gradient entry point (an :class:`SdpaBackward`).
+
+    Returns:
+        A backend that calls ``forward`` and whose ``backward`` attribute calls
+        ``backward`` — registrable like any other backend, and recognised by
+        :func:`supports_backward`.
+    """
+    return _PairedBackend(forward, backward)
+
+
+def supports_backward(backend: object) -> bool:
+    """Return ``True`` if ``backend`` exposes a callable ``backward``.
+
+    Backward support is optional, so callers that need gradients should test for
+    it rather than assume it: an inference-only backend has no ``backward`` and
+    is still fully conforming.
+    """
+    return callable(getattr(backend, "backward", None))
+
+
+def backward_for(backend: object) -> SdpaBackward:
+    """Return ``backend``'s gradient entry point.
+
+    Args:
+        backend: Any backend, typically from :func:`get_backend`.
+
+    Returns:
+        The backend's ``backward`` callable.
+
+    Raises:
+        NotImplementedError: If the backend does not implement the backward
+            pass (check first with :func:`supports_backward`).
+    """
+    entry = getattr(backend, "backward", None)
+    if not callable(entry):
+        raise NotImplementedError(
+            f"backend {backend!r} does not implement the backward pass; "
+            "use portable_attention.scaled_dot_product_attention_backward "
+            "for CPU gradients."
+        )
+    return cast(SdpaBackward, entry)
 
 
 _RESERVED = frozenset({"auto"})
@@ -189,6 +374,40 @@ def _auto_dispatch(
     )
 
 
+def _auto_backward(
+    grad_output: Array,
+    query: Array,
+    key: Array,
+    value: Array,
+    attn_mask: NDArray[np.floating] | NDArray[np.bool_] | None = None,
+    is_causal: bool = False,
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> tuple[Array, Array, Array]:
+    """The ``"auto"`` backend's backward: delegate to the selected backend.
+
+    Selection uses the same shape policy as the forward call, so a training step
+    computes both passes on one backend.
+
+    Raises:
+        NotImplementedError: If the selected backend has no backward pass.
+    """
+    return backward_for(_auto_select(query))(
+        grad_output,
+        query,
+        key,
+        value,
+        attn_mask,
+        is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
+_AUTO_BACKEND = with_backward(_auto_dispatch, _auto_backward)
+
+
 def get_backend(name: str = "auto") -> SdpaBackend:
     """Resolve a backend by name.
 
@@ -204,7 +423,7 @@ def get_backend(name: str = "auto") -> SdpaBackend:
         ValueError: If ``name`` is not a known backend.
     """
     if name == "auto":
-        return _auto_dispatch
+        return _AUTO_BACKEND
     try:
         return _REGISTRY[name]
     except KeyError:
@@ -265,5 +484,6 @@ def scaled_dot_product_attention(
 
 # The reference backend is the correctness oracle and is always available; the
 # fused backend is the fast, dtype-preserving CPU path validated against it.
-register_backend("reference", _reference_sdpa)
-register_backend("fused", _fused_sdpa)
+# Both are trainable: their forward and backward passes are paired here.
+register_backend("reference", with_backward(_reference_sdpa, _reference_backward))
+register_backend("fused", with_backward(_fused_sdpa, _fused_backward))

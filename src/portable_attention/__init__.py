@@ -19,7 +19,11 @@ across the documented contract matrix.
 Training needs the other half of the op: :func:`scaled_dot_product_attention_backward`
 is the CPU oracle for the gradients, returning ``(dq, dk, dv)`` for the same
 argument list the forward pass takes, so the layer can be wrapped in whatever
-autograd machinery a caller already has.
+autograd machinery a caller already has. Backends may implement that half
+themselves: a :class:`TrainableSdpaBackend` carries a ``backward`` alongside its
+forward call (both CPU backends do), reachable with :func:`backward_for` and
+detectable with :func:`supports_backward`. Backward support stays optional, so
+an inference-only backend is still a complete one.
 
 Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
 :class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
@@ -52,10 +56,15 @@ from .conformance import (
 )
 from .dispatch import (
     SdpaBackend,
+    SdpaBackward,
+    TrainableSdpaBackend,
     available_backends,
+    backward_for,
     get_backend,
     register_backend,
     scaled_dot_product_attention,
+    supports_backward,
+    with_backward,
 )
 from .tiling import (
     DeviceLimits,
@@ -75,8 +84,10 @@ __all__ = [
     "ConformanceResult",
     "DeviceLimits",
     "SdpaBackend",
+    "SdpaBackward",
     "TilePlan",
     "TileSizingError",
+    "TrainableSdpaBackend",
     "VulkanAttention",
     "VulkanBuffer",
     "VulkanCapability",
@@ -87,6 +98,7 @@ __all__ = [
     "__version__",
     "assert_conforms",
     "available_backends",
+    "backward_for",
     "blocked_attention",
     "candidate_plans",
     "check_backend",
@@ -99,8 +111,10 @@ __all__ = [
     "scaled_dot_product_attention",
     "scaled_dot_product_attention_backward",
     "shared_memory_bytes_for",
+    "supports_backward",
     "tile_plan_for",
     "vulkan_available",
+    "with_backward",
 ]
 
 # Single source of truth for the package version. The build backend

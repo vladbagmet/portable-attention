@@ -14,11 +14,16 @@ import pytest
 import portable_attention
 from portable_attention import (
     SdpaBackend,
+    TrainableSdpaBackend,
     available_backends,
+    backward_for,
     get_backend,
     register_backend,
     scaled_dot_product_attention,
+    supports_backward,
+    with_backward,
 )
+from portable_attention.backward import scaled_dot_product_attention_backward
 from portable_attention.dispatch import _REGISTRY, _auto_select
 
 
@@ -231,3 +236,139 @@ def test_dispatch_module_all_is_reexported():
     # surfaced on the package so the seam has a single public import path.
     for name in portable_attention.dispatch.__all__:
         assert hasattr(portable_attention, name)
+
+
+def _grad_output(seed: int = 0):
+    return np.random.default_rng(seed + 50).standard_normal((2, 3, 5, 4))
+
+
+def test_cpu_backends_expose_a_backward():
+    for name in ("reference", "fused"):
+        backend = get_backend(name)
+        assert supports_backward(backend)
+        assert isinstance(backend, TrainableSdpaBackend)
+
+
+def test_reference_backward_is_the_oracle():
+    q, k, v = _inputs(seed=2)
+    g = _grad_output(2)
+    got = backward_for(get_backend("reference"))(g, q, k, v, is_causal=True)
+    want = scaled_dot_product_attention_backward(g, q, k, v, is_causal=True)
+    for grad, oracle in zip(got, want):
+        np.testing.assert_array_equal(grad, oracle)
+
+
+def test_backward_is_optional_for_a_backend():
+    def forward_only(query, key, value, *args, **kwargs):
+        return get_backend("reference")(query, key, value, *args, **kwargs)
+
+    register_backend("inference-only", forward_only)
+    backend = get_backend("inference-only")
+    assert isinstance(backend, SdpaBackend)
+    assert not supports_backward(backend)
+    assert not isinstance(backend, TrainableSdpaBackend)
+    with pytest.raises(NotImplementedError, match="does not implement the backward"):
+        backward_for(backend)
+
+
+def test_supports_backward_rejects_a_non_callable_attribute():
+    class Impostor:
+        backward = "not callable"
+
+    assert not supports_backward(Impostor())
+
+
+def test_with_backward_forwards_both_halves():
+    seen: list[tuple[str, object, object]] = []
+
+    def forward(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kw
+    ):
+        seen.append(("forward", is_causal, kw.get("scale")))
+        return get_backend("reference")(
+            query, key, value, attn_mask, dropout_p, is_causal, **kw
+        )
+
+    def backward(grad, query, key, value, attn_mask=None, is_causal=False, **kw):
+        seen.append(("backward", is_causal, kw.get("scale")))
+        return scaled_dot_product_attention_backward(
+            grad, query, key, value, attn_mask, is_causal, **kw
+        )
+
+    backend = with_backward(forward, backward)
+    q, k, v = _inputs(seed=3)
+    g = _grad_output(3)
+    out = backend(q, k, v, None, 0.0, True, scale=0.25, enable_gqa=False)
+    grads = backend.backward(g, q, k, v, None, True, scale=0.25, enable_gqa=False)
+
+    assert seen == [("forward", True, 0.25), ("backward", True, 0.25)]
+    np.testing.assert_array_equal(
+        out, get_backend("reference")(q, k, v, is_causal=True, scale=0.25)
+    )
+    want = scaled_dot_product_attention_backward(g, q, k, v, is_causal=True, scale=0.25)
+    for grad, oracle in zip(grads, want):
+        np.testing.assert_array_equal(grad, oracle)
+
+
+def test_paired_backend_repr_names_the_forward():
+    assert "scaled_dot_product_attention" in repr(get_backend("reference"))
+    assert repr(with_backward(lambda *a, **kw: None, lambda *a, **kw: None))
+
+
+def test_a_class_backend_with_a_backward_method_qualifies():
+    class ClassBackend:
+        def __call__(self, query, key, value, *args, **kwargs):
+            return get_backend("reference")(query, key, value, *args, **kwargs)
+
+        def backward(self, grad_output, query, key, value, *args, **kwargs):
+            return scaled_dot_product_attention_backward(
+                grad_output, query, key, value, *args, **kwargs
+            )
+
+    register_backend("classy", ClassBackend())
+    backend = get_backend("classy")
+    assert supports_backward(backend)
+    q, k, v = _inputs(seed=4)
+    g = _grad_output(4)
+    got = backward_for(backend)(g, q, k, v)
+    want = scaled_dot_product_attention_backward(g, q, k, v)
+    for grad, oracle in zip(got, want):
+        np.testing.assert_array_equal(grad, oracle)
+
+
+def test_auto_backward_follows_the_forward_selection():
+    calls: list[str] = []
+
+    def record(name):
+        def backward(grad_output, query, key, value, *args, **kwargs):
+            calls.append(name)
+            return scaled_dot_product_attention_backward(
+                grad_output, query, key, value, *args, **kwargs
+            )
+
+        return backward
+
+    for name in ("reference", "fused"):
+        register_backend(
+            name, with_backward(get_backend(name), record(name)), overwrite=True
+        )
+
+    auto = get_backend("auto")
+    batched_q, batched_k, batched_v = _inputs(seed=5)
+    backward_for(auto)(_grad_output(5), batched_q, batched_k, batched_v)
+
+    single_q, single_k, single_v = _single_slice_inputs(seed=5)
+    single_g = np.random.default_rng(60).standard_normal((5, 4))
+    backward_for(auto)(single_g, single_q, single_k, single_v)
+
+    assert calls == ["fused", "reference"]
+
+
+def test_auto_backward_reports_an_unsupported_selection():
+    def forward_only(query, key, value, *args, **kwargs):
+        return get_backend("reference")(query, key, value, *args, **kwargs)
+
+    register_backend("fused", forward_only, overwrite=True)
+    q, k, v = _inputs(seed=6)
+    with pytest.raises(NotImplementedError, match="does not implement the backward"):
+        backward_for(get_backend("auto"))(_grad_output(6), q, k, v)

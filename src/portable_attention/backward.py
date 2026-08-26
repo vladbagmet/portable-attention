@@ -49,7 +49,19 @@ from .reference import (
 __all__ = ["scaled_dot_product_attention_backward"]
 
 
-def _sum_to_shape(grad: NDArray[np.float64], shape: tuple[int, ...]) -> Array:
+def expected_output_shape(weights: Array, value: Array) -> tuple[int, ...]:
+    """Return the forward output shape implied by ``weights`` and ``value``.
+
+    The forward output is ``P @ V``, so its batch axes are the broadcast of the
+    weights' and the value's: the value alone may carry a batch axis the weights
+    do not have (a 2-D query and key against a batched value). Shared by every
+    backward implementation so they all validate ``grad_output`` the same way.
+    """
+    batch = np.broadcast_shapes(weights.shape[:-2], value.shape[:-2])
+    return (*batch, weights.shape[-2], value.shape[-1])
+
+
+def sum_to_shape(grad: Array, shape: tuple[int, ...]) -> Array:
     """Reduce ``grad`` back onto an input that NumPy broadcast in the forward.
 
     ``matmul`` broadcasts leading dimensions, so an input may be smaller than
@@ -67,7 +79,7 @@ def _sum_to_shape(grad: NDArray[np.float64], shape: tuple[int, ...]) -> Array:
     return reduced
 
 
-def _fold_gqa_heads(grad: NDArray[np.float64], heads: int) -> NDArray[np.float64]:
+def fold_gqa_heads(grad: Array, heads: int) -> Array:
     """Sum a query-head-shaped gradient back onto ``heads`` key/value heads.
 
     Grouped-query attention repeats each key/value head ``H_q // H_kv`` times
@@ -77,7 +89,7 @@ def _fold_gqa_heads(grad: NDArray[np.float64], heads: int) -> NDArray[np.float64
     if repeats == 1:
         return grad
     grouped = grad.reshape(*grad.shape[:-3], heads, repeats, *grad.shape[-2:])
-    folded: NDArray[np.float64] = grouped.sum(axis=-3)
+    folded: Array = grouped.sum(axis=-3)
     return folded
 
 
@@ -125,11 +137,7 @@ def scaled_dot_product_attention_backward(
         query, key, value, attn_mask, is_causal, enable_gqa
     )
     weights = attention_weights(query, expanded_key, attn_mask, is_causal, scale)
-    # The forward output is P @ V, so its batch axes are the broadcast of the
-    # weights' and the value's — the value alone may carry a batch axis the
-    # weights do not have (a 2-D query and key against a batched value).
-    batch = np.broadcast_shapes(weights.shape[:-2], expanded_value.shape[:-2])
-    expected = (*batch, weights.shape[-2], expanded_value.shape[-1])
+    expected = expected_output_shape(weights, expanded_value)
     if grad_output.shape != expected:
         raise ValueError(
             f"grad_output has shape {grad_output.shape}, but the forward output "
@@ -155,10 +163,10 @@ def scaled_dot_product_attention_backward(
     grad_key = np.matmul(np.swapaxes(grad_scores, -1, -2), q) * scale_val
 
     if enable_gqa:
-        grad_key = _fold_gqa_heads(grad_key, key.shape[-3])
-        grad_value = _fold_gqa_heads(grad_value, value.shape[-3])
+        grad_key = fold_gqa_heads(grad_key, key.shape[-3])
+        grad_value = fold_gqa_heads(grad_value, value.shape[-3])
 
-    dq: Array = _sum_to_shape(grad_query, query.shape).astype(query.dtype)
-    dk: Array = _sum_to_shape(grad_key, key.shape).astype(key.dtype)
-    dv: Array = _sum_to_shape(grad_value, value.shape).astype(value.dtype)
+    dq: Array = sum_to_shape(grad_query, query.shape).astype(query.dtype)
+    dk: Array = sum_to_shape(grad_key, key.shape).astype(key.dtype)
+    dv: Array = sum_to_shape(grad_value, value.shape).astype(value.dtype)
     return dq, dk, dv

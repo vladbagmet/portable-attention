@@ -58,8 +58,9 @@ set of names re-exported from the top-level package (its `__all__`):
 `scaled_dot_product_attention`, its gradient
 `scaled_dot_product_attention_backward` (see [Gradients](#gradients)),
 `__version__`, the backend-registry helpers
-`get_backend`, `available_backends`, `register_backend`, and the `SdpaBackend`
-protocol, the conformance kit `assert_conforms`, `check_backend`,
+`get_backend`, `available_backends`, `register_backend`, the `SdpaBackend`
+protocol and its trainable variants `SdpaBackward`, `TrainableSdpaBackend`,
+`with_backward`, `supports_backward`, and `backward_for`, the conformance kit `assert_conforms`, `check_backend`,
 `conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
 detection helpers `detect_vulkan`, `vulkan_available`, `VulkanCapability`, and
 `VulkanDevice`, and the Vulkan backend `VulkanAttention` with its
@@ -399,6 +400,26 @@ state and imports nothing beyond NumPy, so it can sit inside whatever autograd
 machinery you already have (a `torch.autograd.Function`, a JAX custom VJP, or a
 hand-rolled tape). It is checked against central finite differences of the
 forward oracle across the same contract matrix the forward suite covers.
+
+A backend can supply its own backward instead, and both CPU backends do: the
+`fused` one computes the gradients in the input's native precision with the same
+BLAS pin its forward pass uses, so a training step does not fall back to the
+float64 oracle. Backward support is optional — an inference-only backend is a
+complete backend — so ask before reaching for it:
+
+```python
+from portable_attention import backward_for, get_backend, supports_backward
+
+backend = get_backend("auto")
+if supports_backward(backend):
+    dq, dk, dv = backward_for(backend)(grad_out, query, key, value, is_causal=True)
+```
+
+The arguments and the return contract are the ones documented above; `"auto"`
+picks the same backend for the backward pass that it picks for the forward one.
+To write a trainable backend, either give it a `backward` method (making it a
+`TrainableSdpaBackend`) or pair two plain functions with
+`with_backward(forward, backward)` and register the result.
 
 ## CPU performance and BLAS threads
 

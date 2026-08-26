@@ -7,6 +7,10 @@ leading dims, non-square scores, dtypes, scale, and every masking mode. These
 tests also lock the two hard guarantees the fast path must never break —
 ``query``'s dtype is preserved, and fully-masked rows resolve to exact zeros —
 and confirm the backend is registered and satisfies the protocol.
+
+The same bar applies to the backend's backward pass: its gradients must match
+the float64 gradient oracle to the tolerance its native compute precision
+allows, across masks, grouped-query attention, and broadcast inputs.
 """
 
 from __future__ import annotations
@@ -20,7 +24,13 @@ from portable_attention import (
     available_backends,
     get_backend,
 )
+from portable_attention.backward import (
+    scaled_dot_product_attention_backward as reference_backward,
+)
 from portable_attention.fused import scaled_dot_product_attention as fused
+from portable_attention.fused import (
+    scaled_dot_product_attention_backward as fused_backward,
+)
 from portable_attention.reference import (
     scaled_dot_product_attention as reference,
 )
@@ -55,8 +65,11 @@ def test_fused_satisfies_protocol() -> None:
     assert isinstance(get_backend("fused"), SdpaBackend)
 
 
-def test_fused_lookup_returns_the_module_callable() -> None:
-    assert get_backend("fused") is fused
+def test_fused_lookup_delegates_to_the_module_callable() -> None:
+    # The registry entry pairs the module's forward and backward functions, so
+    # it is not the forward function itself but must compute the same thing.
+    q, k, v = _inputs((2, 4, 6, 8), (2, 4, 6, 8), (2, 4, 6, 4), np.dtype(np.float32))
+    np.testing.assert_array_equal(get_backend("fused")(q, k, v), fused(q, k, v))
 
 
 DTYPES = [np.float32, np.float64]
@@ -292,3 +305,122 @@ def test_runs_without_threadpoolctl(monkeypatch: pytest.MonkeyPatch) -> None:
     np.testing.assert_allclose(
         fused(q, k, v), reference(q, k, v), **_TOL[np.dtype(np.float32)]
     )
+
+
+def _grad_inputs(
+    shape_q: tuple[int, ...],
+    shape_k: tuple[int, ...],
+    shape_v: tuple[int, ...],
+    dtype: np.dtype[np.floating],
+    seed: int = 0,
+    **kwargs: object,
+) -> tuple[
+    tuple[NDArray[np.floating], ...],
+    NDArray[np.floating],
+]:
+    """Return ``(q, k, v)`` plus an upstream gradient shaped like the output."""
+    q, k, v = _inputs(shape_q, shape_k, shape_v, dtype, seed)
+    out = fused(q, k, v, **kwargs)  # type: ignore[arg-type]
+    grad = np.random.default_rng(seed + 100).standard_normal(out.shape).astype(dtype)
+    return (q, k, v), grad
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"scale": 0.3},
+        {"is_causal": True},
+    ],
+    ids=["plain", "scaled", "causal"],
+)
+def test_backward_matches_the_oracle(
+    dtype: type[np.floating], kwargs: dict[str, object]
+) -> None:
+    dt = np.dtype(dtype)
+    (q, k, v), g = _grad_inputs((2, 4, 6, 8), (2, 4, 6, 8), (2, 4, 6, 4), dt, **kwargs)
+    got = fused_backward(g, q, k, v, **kwargs)  # type: ignore[arg-type]
+    want = reference_backward(g, q, k, v, **kwargs)  # type: ignore[arg-type]
+    for grad, oracle in zip(got, want):
+        np.testing.assert_allclose(grad, oracle, **_TOL[dt])
+
+
+@pytest.mark.parametrize("mask_kind", ["bool", "additive", "fully-masked"])
+def test_backward_matches_the_oracle_under_masks(mask_kind: str) -> None:
+    dt = np.dtype(np.float32)
+    rng = np.random.default_rng(11)
+    if mask_kind == "bool":
+        mask: NDArray[np.floating] | NDArray[np.bool_] = rng.random((5, 7)) > 0.3
+    elif mask_kind == "additive":
+        mask = rng.standard_normal((5, 7)).astype(dt)
+    else:
+        mask = np.ones((2, 5, 7), dtype=bool)
+        mask[0] = False
+    (q, k, v), g = _grad_inputs(
+        (2, 5, 8), (2, 7, 8), (2, 7, 4), dt, seed=12, attn_mask=mask
+    )
+    got = fused_backward(g, q, k, v, attn_mask=mask)
+    want = reference_backward(g, q, k, v, attn_mask=mask)
+    for grad, oracle in zip(got, want):
+        np.testing.assert_allclose(grad, oracle, **_TOL[dt])
+
+
+def test_backward_folds_grouped_query_heads() -> None:
+    dt = np.dtype(np.float64)
+    (q, k, v), g = _grad_inputs(
+        (2, 8, 5, 8), (2, 2, 7, 8), (2, 2, 7, 4), dt, seed=13, enable_gqa=True
+    )
+    dq, dk, dv = fused_backward(g, q, k, v, enable_gqa=True)
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+    want = reference_backward(g, q, k, v, enable_gqa=True)
+    for grad, oracle in zip((dq, dk, dv), want):
+        np.testing.assert_allclose(grad, oracle, **_TOL[dt])
+
+
+def test_backward_reduces_broadcast_inputs() -> None:
+    dt = np.dtype(np.float64)
+    (q, _, _), _ = _grad_inputs((2, 3, 5, 8), (2, 3, 7, 8), (2, 3, 7, 4), dt, seed=14)
+    rng = np.random.default_rng(15)
+    k = rng.standard_normal((1, 3, 7, 8))
+    v = rng.standard_normal((1, 3, 7, 4))
+    g = rng.standard_normal((2, 3, 5, 4))
+    dq, dk, dv = fused_backward(g, q, k, v)
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+    want = reference_backward(g, q, k, v)
+    for grad, oracle in zip((dq, dk, dv), want):
+        np.testing.assert_allclose(grad, oracle, **_TOL[dt])
+
+
+def test_backward_preserves_input_dtypes() -> None:
+    dt = np.dtype(np.float16)
+    (q, k, v), g = _grad_inputs((2, 4, 6, 8), (2, 4, 6, 8), (2, 4, 6, 4), dt, seed=16)
+    dq, dk, dv = fused_backward(g, q, k, v)
+    assert (dq.dtype, dk.dtype, dv.dtype) == (q.dtype, k.dtype, v.dtype)
+    # float16 is computed in float32 and rounded back, so compare loosely.
+    want = reference_backward(g, q, k, v)
+    for grad, oracle in zip((dq, dk, dv), want):
+        np.testing.assert_allclose(grad, oracle, rtol=5e-3, atol=5e-3)
+
+
+def test_backward_rejects_mismatched_grad_output() -> None:
+    q, k, v = _inputs((2, 5, 8), (2, 7, 8), (2, 7, 4), np.dtype(np.float32))
+    g = np.zeros((2, 5, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="forward output for these inputs"):
+        fused_backward(g, q, k, v)
+
+
+def test_backward_rejects_causal_with_mask() -> None:
+    q, k, v = _inputs((5, 8), (7, 8), (7, 4), np.dtype(np.float32))
+    g = np.zeros((5, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="not both"):
+        fused_backward(g, q, k, v, np.ones((5, 7), dtype=bool), is_causal=True)
+
+
+def test_backward_runs_unpinned_for_a_single_slice() -> None:
+    # A 2-D call has one GEMM slice, so the BLAS pin is skipped; the gradients
+    # must be identical either way.
+    dt = np.dtype(np.float64)
+    (q, k, v), g = _grad_inputs((5, 8), (7, 8), (7, 4), dt, seed=17)
+    for grad, oracle in zip(fused_backward(g, q, k, v), reference_backward(g, q, k, v)):
+        np.testing.assert_allclose(grad, oracle, **_TOL[dt])
