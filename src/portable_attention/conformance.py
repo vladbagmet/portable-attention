@@ -26,24 +26,44 @@ Typical use, both in the project's own tests and downstream::
 The cases are exposed as data (:func:`conformance_cases`) so a test suite can
 parametrize over them, and :func:`check_backend` returns structured results for
 programmatic inspection.
+
+The *backward* pass has its own half of the kit
+(:func:`backward_conformance_cases`, :func:`check_backward`,
+:func:`assert_backward_conforms`), checked the same way against
+:func:`portable_attention.backward.scaled_dot_product_attention_backward`.
+Backward support is optional, so only backends that advertise it are held to
+that half::
+
+    from portable_attention import get_backend, supports_backward
+    from portable_attention.conformance import assert_backward_conforms
+
+    backend = get_backend("fused")
+    if supports_backward(backend):
+        assert_backward_conforms(backend)
 """
 
 from __future__ import annotations
 
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .backward import scaled_dot_product_attention_backward as _reference_backward
 from .reference import scaled_dot_product_attention as _reference
 
 __all__ = [
     "ConformanceCase",
     "ConformanceResult",
+    "assert_backward_conforms",
     "assert_conforms",
+    "backward_conformance_cases",
     "check_backend",
+    "check_backward",
+    "check_backward_case",
     "check_case",
     "conformance_cases",
 ]
@@ -55,10 +75,16 @@ Array = NDArray[np.floating]
 # and can validate any conforming callable, including bare functions.
 Backend = Callable[..., Array]
 
-# The oracle, viewed through the generic backend alias so ``**kwargs`` (whose
-# values are ``object``) type-checks against its call rather than the concrete
-# strongly-typed reference signature.
+# A backward callable matching
+# ``portable_attention.backward.scaled_dot_product_attention_backward``, kept as
+# a plain alias for the same reason as ``Backend``.
+Backward = Callable[..., "tuple[Array, Array, Array]"]
+
+# The oracles, viewed through the generic aliases so ``**kwargs`` (whose values
+# are ``object``) type-check against their calls rather than the concrete
+# strongly-typed reference signatures.
 _oracle: Backend = _reference
+_backward_oracle: Backward = _reference_backward
 
 # Per-dtype agreement budget against the float64 oracle. float64 backends should
 # match it almost exactly; lower-precision backends compute natively and so
@@ -328,4 +354,194 @@ def assert_conforms(
         report = "\n".join(f"  - {r.name}: {r.detail}" for r in failures)
         raise AssertionError(
             f"backend failed {len(failures)} conformance case(s):\n{report}"
+        )
+
+
+# --- backward half --------------------------------------------------------
+
+
+def _backward_extra_cases() -> list[ConformanceCase]:
+    """Cases that exercise gradient-specific machinery the forward matrix skips.
+
+    The backward pass carries reductions the forward pass gets from NumPy for
+    free: an input that was broadcast in the forward receives the *sum* of the
+    gradients over every axis that was broadcast (a leading axis of length 1, or
+    a leading axis the input does not have at all). These live in the backward
+    matrix only — broadcasting inputs against each other is not part of what a
+    device forward kernel is required to support.
+    """
+    return [
+        ConformanceCase(
+            name="broadcast-kv-batch",
+            make_inputs=_inputs(
+                (2, 3, 5, 8), (1, 3, 7, 8), (1, 3, 7, 4), np.float64, 11
+            ),
+        ),
+        ConformanceCase(
+            name="unbatched-kv",
+            make_inputs=_inputs((2, 3, 5, 8), (7, 8), (7, 4), np.float64, 12),
+        ),
+        ConformanceCase(
+            name="value-only-batch-axis",
+            make_inputs=_inputs((5, 8), (7, 8), (2, 7, 4), np.float64, 13),
+        ),
+    ]
+
+
+def backward_conformance_cases() -> list[ConformanceCase]:
+    """Return the canonical matrix every *backward* implementation must pass.
+
+    This is :func:`conformance_cases` — the same shapes, dtypes, scales, masks
+    and grouped-query configurations, since a gradient has to cover the contract
+    surface its forward pass does — plus a few broadcast cases that only the
+    backward has machinery for (see :func:`_backward_extra_cases`).
+
+    ``dropout_p`` never appears in the matrix: the forward contract supports
+    only ``0.0``, so the backward signature has no counterpart for it.
+    """
+    return conformance_cases() + _backward_extra_cases()
+
+
+def _grad_output_for(
+    case: ConformanceCase, shape: tuple[int, ...], dtype: np.dtype[np.floating]
+) -> Array:
+    """Build the deterministic upstream gradient for ``case``.
+
+    Seeded from the case name (via CRC32, which — unlike ``hash`` — is stable
+    across interpreter runs) so a failure reproduces exactly, and so the same
+    case always feeds every backend the same gradient.
+    """
+    rng = np.random.default_rng(zlib.crc32(case.name.encode("utf-8")))
+    grad: Array = rng.standard_normal(shape).astype(dtype)
+    return grad
+
+
+def _resolve_backward(backward: object) -> Callable[..., object]:
+    """Accept either a bare backward callable or a backend that carries one.
+
+    The result is typed as returning ``object``, not ``(dq, dk, dv)``: the whole
+    job of the runner is to check what an implementation *actually* returned,
+    which a declared return type would assume away.
+    """
+    entry = getattr(backward, "backward", backward)
+    if not callable(entry):
+        raise TypeError(
+            f"{backward!r} is neither a backward callable nor a backend with a "
+            "backward attribute."
+        )
+    return entry
+
+
+def check_backward_case(backward: object, case: ConformanceCase) -> ConformanceResult:
+    """Run one case against a backward implementation and return the result.
+
+    ``backward`` may be the gradient callable itself or a backend object that
+    exposes one as a ``backward`` attribute (a
+    :class:`portable_attention.TrainableSdpaBackend`), so both
+    ``check_backward_case(backward_for(b), case)`` and
+    ``check_backward_case(b, case)`` work.
+
+    The upstream gradient is generated deterministically from the case name and
+    shaped like the oracle's forward output. The implementation passes when its
+    ``(dq, dk, dv)``:
+
+    * is a three-element tuple of arrays;
+    * matches each input's shape and dtype (including where the forward pass
+      broadcast that input, which the gradient must be summed back onto);
+    * is finite; and
+    * agrees with the CPU backward oracle to the same dtype-appropriate
+      tolerance the forward half uses, with exactly-zero query gradients for
+      fully-masked rows.
+
+    Like :func:`check_case`, a nonconforming implementation produces a failed
+    result rather than an exception; errors from the oracle are kit bugs and
+    still propagate.
+    """
+    entry = _resolve_backward(backward)
+    query, key, value = case.make_inputs()
+    kwargs = dict(case.kwargs)
+    forward_out = _oracle(query, key, value, **kwargs)
+    grad_output = _grad_output_for(case, forward_out.shape, query.dtype)
+    want = _backward_oracle(grad_output, query, key, value, **kwargs)
+
+    try:
+        got = entry(grad_output, query, key, value, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - any raise on a valid case fails it
+        return _describe(case, f"backward raised {type(exc).__name__}: {exc}")
+
+    if not isinstance(got, tuple) or len(got) != 3:
+        return _describe(case, f"expected a (dq, dk, dv) 3-tuple, got {type(got)}")
+
+    tol = _tol_for(query.dtype)
+    grads: list[Array] = []
+    for label, grad, want_grad, source in zip(
+        ("dq", "dk", "dv"), got, want, (query, key, value)
+    ):
+        if not isinstance(grad, np.ndarray):
+            return _describe(case, f"{label} is {type(grad)}, not an ndarray")
+        grads.append(cast(Array, grad))
+        if grad.shape != source.shape:
+            return _describe(
+                case, f"{label} shape {grad.shape} != input shape {source.shape}"
+            )
+        if grad.dtype != source.dtype:
+            return _describe(
+                case,
+                f"{label} dtype {grad.dtype} != input dtype {source.dtype} "
+                "(silent cast)",
+            )
+        if not np.all(np.isfinite(grad)):
+            return _describe(case, f"{label} contains non-finite values")
+        got64 = grad.astype(np.float64)
+        want64 = want_grad.astype(np.float64)
+        if not np.allclose(got64, want64, rtol=tol["rtol"], atol=tol["atol"]):
+            max_abs = float(np.max(np.abs(got64 - want64)))
+            return _describe(
+                case, f"{label} mismatch vs oracle (max abs diff {max_abs:.3e})"
+            )
+
+    # A fully-masked query row attends to nothing, so its query gradient is
+    # exactly zero rather than merely small — the backward counterpart of the
+    # forward exact-zero contract.
+    want_dq = want[0]
+    zero_rows = np.all(want_dq == 0.0, axis=-1)
+    if np.any(zero_rows) and not np.array_equal(
+        grads[0][zero_rows], want_dq[zero_rows]
+    ):
+        return _describe(case, "fully-masked rows have nonzero dq")
+
+    return ConformanceResult(name=case.name, passed=True)
+
+
+def check_backward(
+    backward: object, cases: list[ConformanceCase] | None = None
+) -> list[ConformanceResult]:
+    """Run the full backward matrix against a backward implementation.
+
+    Args:
+        backward: The gradient callable under test, or a backend carrying one
+            (see :func:`check_backward_case`).
+        cases: Cases to run; defaults to :func:`backward_conformance_cases`.
+
+    Returns:
+        One :class:`ConformanceResult` per case, in order.
+    """
+    if cases is None:
+        cases = backward_conformance_cases()
+    return [check_backward_case(backward, case) for case in cases]
+
+
+def assert_backward_conforms(
+    backward: object, cases: list[ConformanceCase] | None = None
+) -> None:
+    """Assert a backward implementation passes every backward case.
+
+    Raises:
+        AssertionError: If any case fails, listing each failing case and reason.
+    """
+    failures = [r for r in check_backward(backward, cases) if not r.passed]
+    if failures:
+        report = "\n".join(f"  - {r.name}: {r.detail}" for r in failures)
+        raise AssertionError(
+            f"backward failed {len(failures)} conformance case(s):\n{report}"
         )
