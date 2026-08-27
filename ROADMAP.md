@@ -71,8 +71,9 @@ reproducible benchmark harness.
   `scaled_dot_product_attention_backward` is the gradient oracle, checked
   against finite differences of the forward pass, and the backend contract has
   an optional `backward` entry — `TrainableSdpaBackend`, `with_backward`,
-  `supports_backward`, `backward_for` — which both CPU backends implement; the
-  device kernel and its conformance cases still to come.)*
+  `supports_backward`, `backward_for` — which both CPU backends implement and
+  the conformance kit checks through `assert_backward_conforms`; the device
+  kernel is still to come.)*
 
 Kernel design has to fit the V3D (VideoCore VII) device limits measured on the
 reference board — a flash-style tile must live within 16 KiB of shared memory at

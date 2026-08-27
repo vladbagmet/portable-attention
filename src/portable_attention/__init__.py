@@ -23,7 +23,9 @@ autograd machinery a caller already has. Backends may implement that half
 themselves: a :class:`TrainableSdpaBackend` carries a ``backward`` alongside its
 forward call (both CPU backends do), reachable with :func:`backward_for` and
 detectable with :func:`supports_backward`. Backward support stays optional, so
-an inference-only backend is still a complete one.
+an inference-only backend is still a complete one — but a backend that claims it
+is held to the gradient half of the kit (:func:`assert_backward_conforms`,
+:func:`check_backward`, :func:`backward_conformance_cases`).
 
 Blocked GPU backends share one tile-sizing policy (:func:`plan_tiles`,
 :class:`DeviceLimits`, :class:`TilePlan`) so a new device contributes its
@@ -50,8 +52,11 @@ from .blocked import blocked_attention
 from .conformance import (
     ConformanceCase,
     ConformanceResult,
+    assert_backward_conforms,
     assert_conforms,
+    backward_conformance_cases,
     check_backend,
+    check_backward,
     conformance_cases,
 )
 from .dispatch import (
@@ -96,12 +101,15 @@ __all__ = [
     "VulkanError",
     "VulkanPipeline",
     "__version__",
+    "assert_backward_conforms",
     "assert_conforms",
     "available_backends",
+    "backward_conformance_cases",
     "backward_for",
     "blocked_attention",
     "candidate_plans",
     "check_backend",
+    "check_backward",
     "conformance_cases",
     "detect_vulkan",
     "get_backend",

@@ -60,8 +60,10 @@ set of names re-exported from the top-level package (its `__all__`):
 `__version__`, the backend-registry helpers
 `get_backend`, `available_backends`, `register_backend`, the `SdpaBackend`
 protocol and its trainable variants `SdpaBackward`, `TrainableSdpaBackend`,
-`with_backward`, `supports_backward`, and `backward_for`, the conformance kit `assert_conforms`, `check_backend`,
-`conformance_cases`, `ConformanceCase`, and `ConformanceResult`, and the Vulkan
+`with_backward`, `supports_backward`, and `backward_for`, the conformance kit
+`assert_conforms`, `check_backend`, `conformance_cases`, `ConformanceCase`, and
+`ConformanceResult` with its gradient half `assert_backward_conforms`,
+`check_backward`, and `backward_conformance_cases`, and the Vulkan
 detection helpers `detect_vulkan`, `vulkan_available`, `VulkanCapability`, and
 `VulkanDevice`, and the Vulkan backend `VulkanAttention` with its
 `register_vulkan_backend` (see
@@ -366,6 +368,24 @@ results = check_backend(my_backend)  # structured per-case results to inspect
 `conformance_cases()` returns the case list as data, so you can parametrize a
 test suite over it (`ConformanceCase` / `ConformanceResult` are the public
 types).
+
+A backend that implements the [backward pass](#gradients) is held to a matching
+gradient matrix, checked against the CPU backward oracle the same way:
+
+```python
+from portable_attention import assert_backward_conforms, supports_backward
+
+if supports_backward(my_backend):
+    assert_backward_conforms(my_backend)  # or pass the backward callable
+```
+
+It runs every forward case plus a few broadcast shapes only the backward has
+machinery for, generates a deterministic upstream gradient per case, and checks
+that `(dq, dk, dv)` match the oracle in shape, dtype, finiteness, and value —
+with exactly-zero query gradients for fully-masked rows.
+`backward_conformance_cases()` exposes that matrix as data. Backward support
+stays optional: an inference-only backend skips this half and is still fully
+conforming.
 
 ## Gradients
 
